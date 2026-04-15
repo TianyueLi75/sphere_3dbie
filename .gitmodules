@@ -1,0 +1,4 @@
+[submodule "shtns"]
+	path = shtns
+	url = https://github.com/meliao/shtns.git
+	branch = jax_dev
