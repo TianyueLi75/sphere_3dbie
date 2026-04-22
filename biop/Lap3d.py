@@ -30,37 +30,6 @@ def Lap3d_dl_diag(sh: shtns.sht) -> tuple([jax.Array, jax.Array]):
     return diag_ext, diag_int
 
 # @partial(jax.jit, static_argnames=["sh"])
-def Lap3d_sl_self(S: SphereDict, sh: shtns.sht) -> jax.Array:
-    if S["lmax"] != sh.lmax:
-        print("S lmax does not match sht's lmax, reform sht.")
-        sh = shtns.sht(S["lmax"], S["lmax"])
-
-    Sigma = S["Sigma"][:,:,0] # scalar operator, so only take Sigma_x
-    qlm_sigma = sh.analys_cplx_jax(Sigma)
-
-    diag = Lap3d_sl_diag(sh)
-    qlm_SL_sigma = qlm_sigma * diag
-    SL_sigma = sh.synth_cplx_jax(qlm_SL_sigma)
-
-    return SL_sigma
-
-# @partial(jax.jit, static_argnames=["sh"])
-def Lap3d_dl_self(S: SphereDict, sh: shtns.sht) -> jax.Array:
-    if S["lmax"] != sh.lmax:
-        print("S lmax does not match sht's lmax, reform sht.")
-        sh = shtns.sht(S["lmax"])
-
-    Sigma = S["Sigma"][:,:,0] # scalar operator, so only take Sigma_x
-    qlm_sigma = sh.analys_cplx_jax(Sigma)
-
-    [diag_ext, diag_int] = Lap3d_dl_diag(sh)
-    diag = 0.5*(diag_ext + diag_int) # on-surface DL is average of the two spectra
-    qlm_DL_sigma = qlm_sigma * diag
-    DL_sigma = sh.synth_cplx_jax(qlm_DL_sigma)
-
-    return DL_sigma
-
-# @partial(jax.jit, static_argnames=["sh"])
 # TODO: consider how much of solid harmonics to take out as separate function in spectral space.
 def Lap3d_sl(trg: jax.Array, S: SphereDict, sh: shtns.sht) -> jax.Array:
     if S["lmax"] != sh.lmax:
@@ -96,7 +65,7 @@ def Lap3d_sl(trg: jax.Array, S: SphereDict, sh: shtns.sht) -> jax.Array:
     SL_sigma = jnp.zeros((Ntrg,), dtype = jnp.complex128)
     for trg_i in range(trg_theta.shape[0]):
         val = sh.SH_to_point_cplx(qlm_SL_sigma[trg_i,:], trg_costheta[trg_i], trg_phi[trg_i])
-        jax.debug.print("val at cost = {a}, phi={b} is {c}", a=trg_costheta[trg_i], b=trg_phi[trg_i], c=val)
+        # jax.debug.print("val at cost = {a}, phi={b} is {c}", a=trg_costheta[trg_i], b=trg_phi[trg_i], c=val)
         SL_sigma = SL_sigma.at[trg_i].set(val)
 
     return SL_sigma
@@ -153,36 +122,38 @@ def compute_potential(trg: jax.Array, src: jax.Array, force: jax.Array) -> jax.A
     dz = trg[:,2] - src[:,2]
     dr = jnp.sqrt(dx*dx + dy*dy + dz*dz)
     G = 1/4./jnp.pi / dr * force
+    G = G + 0j
 
     return G
 
-# TODO: decompose the LapSL and focus on the diag-multiply part for BIO solve.
-# @partial(jax.jit, static_argnames=["sh"])
-# def bio_self_apply(S: SphereDict, sh: shtns.sht, density: jax.Array, sl_scal: float, dl_scal: float, sgn: float): # +1 for exterior problem, -1 for interior problem
-#     set_density(S, density)
-    
-#     SLsigma = Lap3d_sl_self(S, sh)
-#     DLsigma = Lap3d_dl_self(S, sh)
-
-#     BIOsigma = sl_scal * SLsigma + dl_scal * (sgn * 0.5 * sigmax + DLsigma) # shape mismatch when using S["Sigma"] r.n. since DLsigma doesn't support vector-valued SH yet. 
-    
-#     return BIOsigma
-
-# Form K = dl_scal*(sgn*0.5*I + DL) + sl_scal*SL
+# Apply SL and DL self-eval spectra to sigma
 @partial(jax.jit, static_argnames=["sh"])
-def bio_diag_mat(sh: shtns.sht, sl_scal: float, dl_scal: float, sgn: float) -> jax.Array:
+def bio_diag_apply(qlm_sigma: jax.Array, sh: shtns.sht, sl_scal: float, dl_scal: float) -> jax.Array:
     sl_diag = Lap3d_sl_diag(sh)
     [dl_diag_ext, dl_diag_int] = Lap3d_dl_diag(sh)
     dl_diag = 0.5*(dl_diag_ext + dl_diag_int)
-    SL = jnp.diag(sl_diag)
-    DL = jnp.diag(dl_diag)
-    K = dl_scal * (sgn * 0.5 * jnp.eye(dl_diag.shape[0]) + DL) + sl_scal * SL
-    return K
+    SL = sl_diag * qlm_sigma
+    DL = dl_diag * qlm_sigma
+    KL = dl_scal * DL + sl_scal * SL
+    return KL
 
+# returns K[sigma] = [dl_scal * (pm I/2 + DL) + sl_scal * SL] [sigma]
+@partial(jax.jit, static_argnames=["sh"])
+def bio_onsurf_apply(sigma: jax.Array, sh: shtns.sht, sl_scal: float, dl_scal: float, sgn: float) -> jax.Array:
+    qlm_sigma = sh.analys_cplx_jax(sigma)
+    qlm_KL_sigma = bio_diag_apply(qlm_sigma, sh, sl_scal, dl_scal)
+    KL_sigma = sh.synth_cplx_jax(qlm_KL_sigma)
+    return sgn * 0.5 * sigma + KL_sigma
+
+def bio_offsurf_apply(trg: jax.Array, S: SphereDict, sh: shtns.sht, sl_scal: float, dl_scal: float) -> jax.Array:
+    SLsigma = Lap3d_sl(trg, S, sh)
+    DLsigma = Lap3d_dl(trg, S, sh)
+    Ksigma = sl_scal * SLsigma + dl_scal * DLsigma 
+    return Ksigma
 
 if __name__ == "__main__":
 
-    lmax = 4
+    lmax = 16
     center = jnp.array([0.,0.,0.])
     radius = 1.
     S = build_sphere(center, radius)
@@ -214,13 +185,6 @@ if __name__ == "__main__":
     sigmay = jnp.zeros(sigmax.shape)
     sigmaz = jnp.zeros(sigmax.shape)
 
-    # Lap op close
-    SLsigma = Lap3d_sl_self(S, sh)
-    DLsigma = Lap3d_dl_self(S, sh)
-    # DEBUG: Analytical SL[Y_1^0] spectra compared to sl and dl evals -- checked for m=0, l=1
-    # jax.debug.print("SL of Y10: {a}", a=SLsigma)
-    # jax.debug.print("DL of Y10: {b}", b=DLsigma)
-
     # Lap op far
     ext = True
     if ext:
@@ -232,59 +196,55 @@ if __name__ == "__main__":
 
     Strg = build_sphere(center, Rtrg)
     Strg, shtrg = quadr_sphere(Strg, lmax)
-    # # Check TWO TARGETS, same r, no vmap yet -- checked for m=0, l=1
-    # xtrg = Strg["Xcart"][2,10:12,0] 
-    # ytrg = Strg["Xcart"][2,10:12,1]
-    # ztrg = Strg["Xcart"][2,10:12,2]
-    # trg_sphere2 = jnp.column_stack([jnp.reshape(xtrg,-1), jnp.reshape(ytrg,-1), jnp.reshape(ztrg,-1)])
-    # SLsigma = Lap3d_sl(trg_sphere2, S, sh)
-    # DLsigma = Lap3d_dl(trg_sphere2, S, sh)
-    # jax.debug.print("at target {a}, R = {b}, SL = {c}, DL = {d}", a=trg_sphere2, b=radius*0.5, c=SLsigma, d = DLsigma) 
+    
+    # BIOp parameter
+    sl_scal = 1.0
+    dl_scal = 1.0
 
     # 2) Manufactured solutions
-    ptsrc = jnp.zeros((1,3))
-    force = jnp.ones((1,1))
+    ptsrc = jnp.array([[0.1,0.3,0.15]]) # shifted source to avoid constant potential on all of S
+    # ptsrc = jnp.zeros((1,3))
+    force = jnp.ones((1,1)) 
 
     trg_sphere = jnp.column_stack([jnp.reshape(x,-1), jnp.reshape(y,-1), jnp.reshape(z,-1)])
     BC_pot = compute_potential(trg_sphere, ptsrc, force)
-    # Attempt 2: direct solve
-    K = bio_diag_mat(sh, 1.0, 1.0, sgn) #-- checked for individual SL and DL diagonals..
-    jax.debug.print("K mat: {}", K)
+    BC_pot = jnp.reshape(BC_pot, x.shape)
+    # BIO and gmres operator; solve
+    LapK_apply = partial(
+        bio_onsurf_apply,
+        sh=sh,
+        sl_scal=1.0, 
+        dl_scal=1.0, 
+        sgn=sgn
+    )
+    gmres_func = lx.FunctionLinearOperator(
+        LapK_apply, jax.eval_shape(lambda: sigmax)
+    )
+    solver = lx.GMRES(rtol=1e-10, atol=1e-12, max_steps=200)
+    solution = lx.linear_solve(
+        gmres_func,
+        BC_pot,
+        solver=solver,
+        options={"y0": jnp.zeros_like(sigmax)},
+    )
+    sig_fromBC = solution.value # This will have the ntheta x nphi grid size
+    # Manually check residual
+    bc_check = bio_onsurf_apply(sig_fromBC, sh, sl_scal, dl_scal, sgn)
+    resid_gmres = jnp.linalg.norm(bc_check - BC_pot)
+    jax.debug.print("Checking residual of solve: {}", resid_gmres)
 
+    # Compare with true solution at target sphere
+    xtrg = Strg["Xcart"][:,:,0] 
+    ytrg = Strg["Xcart"][:,:,1]
+    ztrg = Strg["Xcart"][:,:,2]
+    trg_sphere2 = jnp.column_stack([jnp.reshape(xtrg,-1), jnp.reshape(ytrg,-1), jnp.reshape(ztrg,-1)])
+    S = set_density(S, sig_fromBC)
+    Ksigma = bio_offsurf_apply(trg_sphere2, S, sh, sl_scal, dl_scal) # trg_sphere2 reshaped to be Ntrg x 3, so output is Ntrg x 1.
+    true_pot = compute_potential(trg_sphere2, ptsrc, force) # true_pot also computed as Ntrg x 1
+    diff = jnp.linalg.norm(true_pot - Ksigma)
+    jax.debug.print("At target sphere Rtrg = {a}, error from true potential using lmax = {b} is {c}", a=Rtrg, b=lmax, c=diff)
 
-    # # BIO and gmres operator; solve
-    # # TODO: consider SLop in basis only
-    # # TODO: solve by just multiply inverse diagonal?
-    # LapK_apply = partial(
-    #     bio_self_apply,
-    #     S=S,
-    #     sh=sh,
-    #     sl_scal=1.0, 
-    #     dl_scal=1.0, 
-    #     sgn=sgn
-    # )
-    # gmres_func = lx.FunctionLinearOperator(
-    #     LapK_apply, jax.eval_shape(lambda: sigmax)
-    # )
-    # solver = lx.GMRES(rtol=1e-10, atol=1e-12, max_steps=200)
-    # solution = lx.linear_solve(
-    #     operator,
-    #     BC_pot,
-    #     solver=solver,
-    #     options={"y0": jnp.zeros_like(sigmax)},
-    # )
-    # sigmax_sol = solution.value
-
-    # # Error at trg_sphere2
-    # xtrg = Strg["Xcart"][:,:,0] 
-    # ytrg = Strg["Xcart"][:,:,1]
-    # ztrg = Strg["Xcart"][:,:,2]
-    # trg_sphere2 = jnp.column_stack([jnp.reshape(xtrg,-1), jnp.reshape(ytrg,-1), jnp.reshape(ztrg,-1)])
-    # true_pot = compute_potential(trg_sphere2, ptsrc, force)
-    # SLsigma = Lap3d_sl(trg_sphere2, S, sh)
-    # DLsigma = Lap3d_dl(trg_sphere2, S, sh)
-    # BIOsigma = sl_scal * SLsigma + dl_scal * DLsigma
-    # jax.debug.print("at targets, first test far eval")
+    # TODO: wrong when potential has more than Y00.. 
 
 
 
