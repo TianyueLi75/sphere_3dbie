@@ -9,10 +9,10 @@ import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-# Only for testing
 from sphere import *
-import matplotlib.pyplot as plt
 import shtns
+
+jax.config.update("jax_enable_x64", True)  # support float64
 
 SphereDict = Dict[str, Any]
 
@@ -39,12 +39,14 @@ def Lap3d_sl(trg: jax.Array, S: SphereDict, sh: shtns.sht) -> jax.Array:
     Sigma = S["Sigma"][:,:,0] # scalar operator, so only take Sigma_x
     qlm_sigma = sh.analys_cplx_jax(Sigma)
 
+    assert trg.shape[1] == 3
+
     Ntrg = trg.shape[0]
     trg_dx = trg[:,0] - S["Xc"][0]
     trg_dy = trg[:,1] - S["Xc"][1]
     trg_dz = trg[:,2] - S["Xc"][2]
     trg_dr = jnp.sqrt(trg_dx*trg_dx + trg_dy*trg_dy + trg_dz*trg_dz)
-    trg_phi = jnp.atan(trg_dy / trg_dx)
+    trg_phi = jnp.atan2(trg_dy, trg_dx)
     trg_theta = jnp.acos(trg_dz / trg_dr)
     trg_dr = trg_dr[:,None] # Ntrg x 1
 
@@ -53,7 +55,7 @@ def Lap3d_sl(trg: jax.Array, S: SphereDict, sh: shtns.sht) -> jax.Array:
     rpowers_ext = trg_dr ** (-l_vals-1) # Ntrg x Nlm
     rpowers_int = trg_dr ** (l_vals) # Ntrg x Nlm
     qlm_SL_sigma_ext = rpowers_ext * qlm_sigma * diag
-    qlm_SL_sigma_int = rpowers_int * qlm_sigma * diag
+    qlm_SL_sigma_int = rpowers_int * qlm_sigma * diag # Ntrg x Nlm
 
     qlm_SL_sigma = jnp.where(trg_dr > S['r'], qlm_SL_sigma_ext, qlm_SL_sigma_int)
 
@@ -62,11 +64,10 @@ def Lap3d_sl(trg: jax.Array, S: SphereDict, sh: shtns.sht) -> jax.Array:
     trg_costheta = np.cos(trg_theta)
 
     # TODO: use jax.vmap over all targets
-    SL_sigma = jnp.zeros((Ntrg,), dtype = jnp.complex128)
-    for trg_i in range(trg_theta.shape[0]):
+    SL_sigma = jnp.zeros((Ntrg,1), dtype = jnp.complex128)
+    for trg_i in range(Ntrg):
         val = sh.SH_to_point_cplx(qlm_SL_sigma[trg_i,:], trg_costheta[trg_i], trg_phi[trg_i])
-        # jax.debug.print("val at cost = {a}, phi={b} is {c}", a=trg_costheta[trg_i], b=trg_phi[trg_i], c=val)
-        SL_sigma = SL_sigma.at[trg_i].set(val)
+        SL_sigma = SL_sigma.at[trg_i,0].set(val)
 
     return SL_sigma
 
@@ -83,7 +84,7 @@ def Lap3d_dl(trg: jax.Array, S: SphereDict, sh: shtns.sht) -> jax.Array:
     trg_dy = trg[:,1] - S["Xc"][1]
     trg_dz = trg[:,2] - S["Xc"][2]
     trg_dr = jnp.sqrt(trg_dx*trg_dx + trg_dy*trg_dy + trg_dz*trg_dz)
-    trg_phi = jnp.atan(trg_dy / trg_dz)
+    trg_phi = jnp.atan2(trg_dy, trg_dx)
     trg_theta = jnp.acos(trg_dz / trg_dr)
     trg_dr = trg_dr[:,None] # Ntrg x 1
 
@@ -101,9 +102,9 @@ def Lap3d_dl(trg: jax.Array, S: SphereDict, sh: shtns.sht) -> jax.Array:
     trg_costheta = np.cos(trg_theta)
 
     # TODO: use jax.vmap over all targets
-    DL_sigma = jnp.zeros((Ntrg,), dtype = jnp.complex128)
+    DL_sigma = jnp.zeros((Ntrg,1), dtype = jnp.complex128)
     for trg_i in range(trg_theta.shape[0]):
-        DL_sigma = DL_sigma.at[trg_i].set(sh.SH_to_point_cplx(qlm_DL_sigma[trg_i,:], trg_costheta[trg_i], trg_phi[trg_i]))
+        DL_sigma = DL_sigma.at[trg_i,0].set(sh.SH_to_point_cplx(qlm_DL_sigma[trg_i,:], trg_costheta[trg_i], trg_phi[trg_i]))
 
     return DL_sigma
 
@@ -117,11 +118,14 @@ def compute_potential(trg: jax.Array, src: jax.Array, force: jax.Array) -> jax.A
     else:
         force = force[:,None] # make Nsrc x 1
 
-    dx = trg[:,0] - src[:,0]
-    dy = trg[:,1] - src[:,1]
-    dz = trg[:,2] - src[:,2]
+    srcx = src[:,0][None,:] # reshape source x,y,z into 1 x Nsrc 
+    srcy = src[:,1][None,:]
+    srcz = src[:,2][None,:]
+    dx = trg[:,0][:,None] - srcx # size = Ntrg x Nsrc
+    dy = trg[:,1][:,None] - srcy
+    dz = trg[:,2][:,None] - srcz
     dr = jnp.sqrt(dx*dx + dy*dy + dz*dz)
-    G = 1/4./jnp.pi / dr * force
+    G = jnp.matmul(1/4./jnp.pi / dr, force) # 1/dr has size Ntrg x Nsrc, force has size Nsrc x 1, G has size Ntrg x 1
     G = G + 0j
 
     return G
@@ -153,62 +157,59 @@ def bio_offsurf_apply(trg: jax.Array, S: SphereDict, sh: shtns.sht, sl_scal: flo
 
 if __name__ == "__main__":
 
-    lmax = 16
+    import time
+
+    # Geometry setup
+    lmax = 36
     center = jnp.array([0.,0.,0.])
     radius = 1.
     S = build_sphere(center, radius)
     S, sh = quadr_sphere(S, lmax)
-    x = S["Xcart"][:,:,0]
-    y = S["Xcart"][:,:,1]
-    z = S["Xcart"][:,:,2]
-    xn = S["Xncart"][:,:,0]
-    yn = S["Xncart"][:,:,1]
-    zn = S["Xncart"][:,:,2]
-
-    # # Simple density in x
-    # seed = 1701
-    # key = jax.random.PRNGKey(seed)
-    # key, subkey = jax.random.split(key)
-    # Ycoeff_r = jax.random.uniform(subkey, shape=(sh.nlm_cplx,))
-    # key, subkey = jax.random.split(key)
-    # Ycoeff_i = jax.random.uniform(subkey, shape=(sh.nlm_cplx,)) 
-    # Ycoeff = jax.lax.complex(Ycoeff_r, Ycoeff_i)
-    Ycoeff = jnp.zeros((sh.nlm_cplx,),dtype = jnp.complex128)
-    Ycoeff = Ycoeff.at[2].set(1.0) # coeff(Y10) = 1, all others 0
-    
-    Ynm = sh.synth_cplx_jax(Ycoeff) 
-    sig_x = Ynm
-    S = set_density(S, sig_x)
-    sigmax = S["Sigma"][:,:,0]
-    # sigmay = S["Sigma"][:,1]
-    # sigmaz = S["Sigma"][:,2]
-    sigmay = jnp.zeros(sigmax.shape)
-    sigmaz = jnp.zeros(sigmax.shape)
-
     # Lap op far
     ext = True
     if ext:
-        Rtrg = radius * 1.5
+        Rtrg = radius * 1.00025
         sgn = 1.0 # exterior problem, sgn = +1
     else:
         Rtrg = radius * 0.5
         sgn = -1.0
-
     Strg = build_sphere(center, Rtrg)
     Strg, shtrg = quadr_sphere(Strg, lmax)
-    
     # BIOp parameter
     sl_scal = 1.0
     dl_scal = 1.0
 
-    # 2) Manufactured solutions
+    # # TEST 1: Evaluation using simple scalar density
+    # # # random density
+    # # seed = 1701
+    # # key = jax.random.PRNGKey(seed)
+    # # key, subkey = jax.random.split(key)
+    # # Ycoeff_r = jax.random.uniform(subkey, shape=(sh.nlm_cplx,))
+    # # key, subkey = jax.random.split(key)
+    # # Ycoeff_i = jax.random.uniform(subkey, shape=(sh.nlm_cplx,)) 
+    # # Ycoeff = jax.lax.complex(Ycoeff_r, Ycoeff_i)
+    # # Y10
+    # Ycoeff = jnp.zeros((sh.nlm_cplx,),dtype = jnp.complex128)
+    # Ycoeff = Ycoeff.at[2].set(1.0) 
+    # Ynm = sh.synth_cplx_jax(Ycoeff) 
+    # sig_x = Ynm
+    # S = set_density(S, sig_x)
+    # sigmax = S["Sigma"][:,:,0]
+    # sigmay = jnp.zeros(sigmax.shape)
+    # sigmaz = jnp.zeros(sigmax.shape)
+
+
+    # TEST 2: Manufactured solutions
     ptsrc = jnp.array([[0.1,0.3,0.15]]) # shifted source to avoid constant potential on all of S
-    # ptsrc = jnp.zeros((1,3))
     force = jnp.ones((1,1)) 
 
+    x = S["Xcart"][:,:,0]
+    y = S["Xcart"][:,:,1]
+    z = S["Xcart"][:,:,2]
     trg_sphere = jnp.column_stack([jnp.reshape(x,-1), jnp.reshape(y,-1), jnp.reshape(z,-1)])
     BC_pot = compute_potential(trg_sphere, ptsrc, force)
     BC_pot = jnp.reshape(BC_pot, x.shape)
+
     # BIO and gmres operator; solve
     LapK_apply = partial(
         bio_onsurf_apply,
@@ -218,20 +219,35 @@ if __name__ == "__main__":
         sgn=sgn
     )
     gmres_func = lx.FunctionLinearOperator(
-        LapK_apply, jax.eval_shape(lambda: sigmax)
+        LapK_apply, jax.eval_shape(lambda: jnp.zeros(x.shape, dtype=jnp.complex128))
     )
     solver = lx.GMRES(rtol=1e-10, atol=1e-12, max_steps=200)
+    time_solver_start = time.time()
     solution = lx.linear_solve(
         gmres_func,
         BC_pot,
         solver=solver,
-        options={"y0": jnp.zeros_like(sigmax)},
+        options={"y0": jnp.zeros(x.shape, dtype=jnp.complex128)},
     )
+    time_solver_end = time.time()
+
+    time_solver_start2 = time.time()
+    solution = lx.linear_solve(
+        gmres_func,
+        BC_pot,
+        solver=solver,
+        options={"y0": jnp.zeros(x.shape, dtype=jnp.complex128)},
+    )
+    time_solver_end2 = time.time()
+    print(f"Timing results, first solve: {time_solver_end - time_solver_start}, second solve: {time_solver_end2 - time_solver_start2}")
+
     sig_fromBC = solution.value # This will have the ntheta x nphi grid size
+    stats = solution.stats
     # Manually check residual
     bc_check = bio_onsurf_apply(sig_fromBC, sh, sl_scal, dl_scal, sgn)
     resid_gmres = jnp.linalg.norm(bc_check - BC_pot)
-    jax.debug.print("Checking residual of solve: {}", resid_gmres)
+    jax.debug.print("Checking residual of solve: {a}, number of iterations needed: {b}", a=resid_gmres, b=stats["num_steps"])
+
 
     # Compare with true solution at target sphere
     xtrg = Strg["Xcart"][:,:,0] 
@@ -239,12 +255,22 @@ if __name__ == "__main__":
     ztrg = Strg["Xcart"][:,:,2]
     trg_sphere2 = jnp.column_stack([jnp.reshape(xtrg,-1), jnp.reshape(ytrg,-1), jnp.reshape(ztrg,-1)])
     S = set_density(S, sig_fromBC)
+    time_eval_start = time.time()
     Ksigma = bio_offsurf_apply(trg_sphere2, S, sh, sl_scal, dl_scal) # trg_sphere2 reshaped to be Ntrg x 3, so output is Ntrg x 1.
-    true_pot = compute_potential(trg_sphere2, ptsrc, force) # true_pot also computed as Ntrg x 1
-    diff = jnp.linalg.norm(true_pot - Ksigma)
-    jax.debug.print("At target sphere Rtrg = {a}, error from true potential using lmax = {b} is {c}", a=Rtrg, b=lmax, c=diff)
+    Ksigma.block_until_ready()
+    time_eval_end = time.time()
+    time_eval_start2 = time.time()
+    Ksigma = bio_offsurf_apply(trg_sphere2, S, sh, sl_scal, dl_scal) # trg_sphere2 reshaped to be Ntrg x 3, so output is Ntrg x 1.
+    Ksigma.block_until_ready()
+    time_eval_end2 = time.time()
+    print(f"Timing results, first off-surface eval: {time_eval_end - time_eval_start}, second eval: {time_eval_end2 - time_eval_start2}")
 
-    # TODO: wrong when potential has more than Y00.. 
+    true_pot = compute_potential(trg_sphere2, ptsrc, force) # true_pot also computed as Ntrg x 1
+    # For scalar electric potential calculation, only real values
+    Ksigma = jnp.real(Ksigma)
+    true_pot = jnp.real(true_pot)
+    diff = jnp.max(true_pot - Ksigma) / jnp.max(true_pot )
+    jax.debug.print("At target sphere Rtrg = {a}, relative error from true potential using lmax = {b} is {c}", a=Rtrg, b=lmax, c=diff)
 
 
 

@@ -6,6 +6,7 @@ import os
 import sys
 
 import shtns
+jax.config.update("jax_enable_x64", True)  # support float64
 
 SphereDict = Dict[str, Any]
 
@@ -16,7 +17,7 @@ def build_sphere(center: jax.Array, radius: float) -> SphereDict:
     return {
         "Xc": center,
         "r": radius,
-        "lmax": -1, 
+        "lmax": int(-1), 
         "Xcart": jnp.array([]), # Npts x 3
         "Xncart": jnp.array([]),
         "Xsph": jnp.array([]), # Npts x 2, theta and phi grids.
@@ -28,7 +29,7 @@ def quadr_sphere(S: SphereDict, lmax: int) -> Tuple[SphereDict, shtns.sht]:
     """Add a regular spherical grid for the sphere surface."""
     S["lmax"] = lmax
     
-    sh = shtns.sht(lmax)
+    sh = shtns.sht(int(lmax))
     ntheta, nphi = sh.set_grid(flags=shtns.SHT_THETA_CONTIGUOUS)
     thetas = jnp.arccos(sh.cos_theta)
     phis = jnp.linspace(0, 2 * jnp.pi, nphi, endpoint=False)
