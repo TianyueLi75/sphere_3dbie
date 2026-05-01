@@ -48,8 +48,8 @@ def Lap3d_sl(trg: jax.Array, S: SphereDict, sh: shtns.sht) -> jax.Array:
     trg_dr = jnp.sqrt(trg_dx*trg_dx + trg_dy*trg_dy + trg_dz*trg_dz)
     trg_phi = jnp.atan2(trg_dy, trg_dx)
     trg_theta = jnp.acos(trg_dz / trg_dr)
-    trg_dr = trg_dr[:,None] # Ntrg x 1
-
+    trg_dr = trg_dr[:,None] # Ntrg x 1    
+    # trg_costheta = jnp.cos(trg_theta)
     l_vals = jnp.asarray(sh.zl, dtype=jnp.float64) # shape ((p+1)^2, )
     diag = Lap3d_sl_diag(sh)
     rpowers_ext = trg_dr ** (-l_vals-1) # Ntrg x Nlm
@@ -59,15 +59,17 @@ def Lap3d_sl(trg: jax.Array, S: SphereDict, sh: shtns.sht) -> jax.Array:
 
     qlm_SL_sigma = jnp.where(trg_dr > S['r'], qlm_SL_sigma_ext, qlm_SL_sigma_int)
 
+    # OLD CODE (commented out):
     qlm_SL_sigma = np.array(qlm_SL_sigma, dtype=np.complex128)
     trg_phi = np.array(trg_phi)
     trg_costheta = np.cos(trg_theta)
-
-    # TODO: use jax.vmap over all targets
     SL_sigma = jnp.zeros((Ntrg,1), dtype = jnp.complex128)
     for trg_i in range(Ntrg):
         val = sh.SH_to_point_cplx(qlm_SL_sigma[trg_i,:], trg_costheta[trg_i], trg_phi[trg_i])
         SL_sigma = SL_sigma.at[trg_i,0].set(val)
+
+    # TODO: cannot use vmap on naive python function since vmap passes in tracers not values.
+    # SL_sigma = jax.vmap(lambda qlm, ct, p: sh.SH_to_point_cplx(qlm, ct.astype(float), p.astype(float)))(qlm_SL_sigma, trg_costheta, trg_phi)[:,None]
 
     return SL_sigma
 
@@ -86,8 +88,8 @@ def Lap3d_dl(trg: jax.Array, S: SphereDict, sh: shtns.sht) -> jax.Array:
     trg_dr = jnp.sqrt(trg_dx*trg_dx + trg_dy*trg_dy + trg_dz*trg_dz)
     trg_phi = jnp.atan2(trg_dy, trg_dx)
     trg_theta = jnp.acos(trg_dz / trg_dr)
-    trg_dr = trg_dr[:,None] # Ntrg x 1
-
+    trg_dr = trg_dr[:,None] # Ntrg x 1    
+    # trg_costheta = jnp.cos(trg_theta)
     l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
     [diag_ext, diag_int] = Lap3d_dl_diag(sh)
     rpowers_ext = trg_dr ** (-l_vals-1) # Ntrg x Nlm
@@ -97,14 +99,16 @@ def Lap3d_dl(trg: jax.Array, S: SphereDict, sh: shtns.sht) -> jax.Array:
 
     qlm_DL_sigma = jnp.where(trg_dr > S['r'], qlm_DL_sigma_ext, qlm_DL_sigma_int)
     
+    # OLD CODE (commented out):
     qlm_DL_sigma = np.array(qlm_DL_sigma, dtype=np.complex128)
     trg_phi = np.array(trg_phi)
     trg_costheta = np.cos(trg_theta)
-
-    # TODO: use jax.vmap over all targets
     DL_sigma = jnp.zeros((Ntrg,1), dtype = jnp.complex128)
     for trg_i in range(trg_theta.shape[0]):
         DL_sigma = DL_sigma.at[trg_i,0].set(sh.SH_to_point_cplx(qlm_DL_sigma[trg_i,:], trg_costheta[trg_i], trg_phi[trg_i]))
+
+    # TODO: see sl comment
+    # DL_sigma = jax.vmap(lambda qlm, ct, p: sh.SH_to_point_cplx(qlm, ct, p))(qlm_DL_sigma, trg_costheta, trg_phi)[:, None]
 
     return DL_sigma
 

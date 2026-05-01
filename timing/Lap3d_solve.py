@@ -12,7 +12,7 @@ import shtns
 import time
 import matplotlib.pyplot as plt
 
-# jax.clear_caches()
+jax.clear_caches()
 jax.config.update("jax_enable_x64", True)  # support float64
 
 def test(lmax: int):
@@ -30,7 +30,8 @@ def test(lmax: int):
         Rtrg = radius * 0.5
         sgn = -1.0
     Strg = build_sphere(center, Rtrg)
-    Strg, shtrg = quadr_sphere(Strg, lmax)
+    lmax_trg = 40 # Fix target size
+    Strg, shtrg = quadr_sphere(Strg, lmax_trg)
     # BIOp parameter
     sl_scal = 1.0
     dl_scal = 1.0
@@ -104,12 +105,12 @@ def test(lmax: int):
     return time_solver, time_eval
 
 if __name__ == "__main__":
-    # pmin = 4
-    # pmax = 1000
-    # pstep = 25
     pmin = 4
-    pmax = 64
-    pstep = 4
+    pmax = 1000
+    pstep = 25
+    # pmin = 4
+    # pmax = 64
+    # pstep = 4
     lmax_list = jnp.arange(pmin, pmax, pstep, dtype = int)
     Np = len(lmax_list)
     Tsolve = np.zeros((Np,))

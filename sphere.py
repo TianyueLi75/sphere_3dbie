@@ -31,6 +31,8 @@ def quadr_sphere(S: SphereDict, lmax: int) -> Tuple[SphereDict, shtns.sht]:
     
     sh = shtns.sht(int(lmax))
     ntheta, nphi = sh.set_grid(flags=shtns.SHT_THETA_CONTIGUOUS)
+    # ntheta, nphi = sh.set_grid(nlat = lmax+1, nphi = 2*lmax+1, flags=shtns.SHT_THETA_CONTIGUOUS)
+    # jax.debug.print("ntheta = {a}, nphi = {b}, size of sh.cos_theta = {c}", a=ntheta, b=nphi, c=sh.cos_theta.shape)
     thetas = jnp.arccos(sh.cos_theta)
     phis = jnp.linspace(0, 2 * jnp.pi, nphi, endpoint=False)
     phi_grid, theta_grid = jnp.meshgrid(phis, thetas, indexing="ij")
