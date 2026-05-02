@@ -157,7 +157,8 @@ def Stk3d_dl_r(trg_r: np.ndarray, S: SphereDict, sh: shtns.sht) -> np.ndarray:
         diag_V2W_int = (l_vals+1.0) * (l_vals + 2.0) / (2.0*l_vals+1.0) # additional coeff for V<-W and W->V
         diag_W2V_ext = 2. * l_vals * (l_vals - 1.0) / (4.0*l_vals+2.0)
         rpowers_V2W_int = trg_dr ** (l_vals + 1.0) - trg_dr ** (l_vals - 1.0)
-        rpowers_W2V_ext = - trg_dr ** (-l_vals - 2.0) + trg_dr ** (-l_vals) # NOTE: TYPO IN PAPER
+        # rpowers_W2V_ext = - trg_dr ** (-l_vals - 2.0) + trg_dr ** (-l_vals) # NOTE: TYPO IN PAPER
+        rpowers_W2V_ext = trg_dr ** (-l_vals - 2.0) - trg_dr ** (-l_vals) # NOTE: this make exterior manufactured solutions correct, so maybe no typo here.
         V2Wlm_DL_sigma_int = rpowers_V2W_int * diag_V2W_int * vlm_sigma
         W2Vlm_DL_sigma_ext = rpowers_W2V_ext * diag_W2V_ext * wlm_sigma
 
@@ -167,70 +168,6 @@ def Stk3d_dl_r(trg_r: np.ndarray, S: SphereDict, sh: shtns.sht) -> np.ndarray:
 
         val_x, val_y, val_z = sig_vwx2xyz(vlm_DL_sigma, wlm_DL_sigma, xlm_DL_sigma, theta, phi, sh)
         DL_sigma[:,:,:,ri] = np.stack([val_x, val_y, val_z], axis=2)
-
-    return DL_sigma
-
-def Stk3d_dl(trg: np.ndarray, S: SphereDict, sh: shtns.sht) -> np.ndarray:
-    if S["lmax"] != sh.lmax:
-        print("S lmax does not match sht's lmax, reform sht.")
-        sh = shtns.sht(S["lmax"], S["lmax"])
-
-    Sigma_x = S["Sigma"][:,:,0] 
-    Sigma_y = S["Sigma"][:,:,1] 
-    Sigma_z = S["Sigma"][:,:,2] 
-    theta = S["Xsph"][:,:,0]
-    phi = S["Xsph"][:,:,1]
-    vlm_sigma, wlm_sigma, xlm_sigma = sig_xyz2vwx(Sigma_x, Sigma_y, Sigma_z, theta, phi, sh)
-
-    assert trg.shape[1] == 3
-
-    Ntrg = trg.shape[0]
-    trg_dx = trg[:,0] - S["Xc"][0]
-    trg_dy = trg[:,1] - S["Xc"][1]
-    trg_dz = trg[:,2] - S["Xc"][2]
-    trg_dr = np.sqrt(trg_dx*trg_dx + trg_dy*trg_dy + trg_dz*trg_dz)
-    trg_phi = np.atan2(trg_dy, trg_dx)
-    trg_theta = np.acos(trg_dz / trg_dr)
-    trg_dr = trg_dr[:,None] # Ntrg x 1
-
-    l_vals = np.asarray(sh.zl, dtype=np.float64) # shape ((p+1)^2, )
-    diag_V_ext, diag_W_ext, diag_X_ext, diag_V_int, diag_W_int, diag_X_int = Stk3d_dl_VWX_diag(sh) # Coeff for V-V, W-W, X-X matches for DL
-    diag_W2V_int = (l_vals+1.0) * (l_vals + 2.0) / (2.0*l_vals+1.0) # additional coeff for V<-W
-    diag_V2W_ext = 2. * l_vals * (l_vals - 1.0) / (4.0*l_vals+2.0) # additional coeff for W<-V
-
-    rpowers_V_ext = trg_dr ** (- l_vals - 2.0) # Ntrg x Nlm
-    rpowers_V_int = trg_dr ** (l_vals + 1.0) 
-    rpowers_W2V_int = trg_dr ** (l_vals + 1.0) - trg_dr ** (l_vals - 1.0)
-    vlm_DL_sigma_ext = rpowers_V_ext * diag_V_ext * vlm_sigma # resulting Vnm coeff from sigma_Vnm terms (DL[V] = aV + bW)
-    vlm_DL_sigma_int = rpowers_V_int * diag_V_int * vlm_sigma + rpowers_W2V_int * diag_W2V_int * wlm_sigma
-
-    rpowers_W_ext = trg_dr ** (-l_vals)
-    rpowers_W_int = trg_dr ** (l_vals - 1.0)
-    rpowers_V2W_ext = trg_dr ** (-l_vals - 2.0) - trg_dr ** (-l_vals)
-    wlm_DL_sigma_ext = rpowers_W_ext * diag_W_ext * wlm_sigma + rpowers_V2W_ext * diag_V2W_ext * vlm_sigma 
-    wlm_DL_sigma_int = rpowers_W_int * diag_W_int * wlm_sigma 
-
-    rpowers_X_ext = trg_dr ** (-l_vals - 1.0)
-    rpowers_X_int = trg_dr ** (l_vals)
-    xlm_DL_sigma_ext = rpowers_X_ext * diag_X_ext * xlm_sigma
-    xlm_DL_sigma_int = rpowers_X_int * diag_X_int * xlm_sigma
-
-    vlm_DL_sigma = np.where(trg_dr > S['r'], vlm_DL_sigma_ext, vlm_DL_sigma_int)
-    wlm_DL_sigma = np.where(trg_dr > S['r'], wlm_DL_sigma_ext, wlm_DL_sigma_int)
-    xlm_DL_sigma = np.where(trg_dr > S['r'], xlm_DL_sigma_ext, xlm_DL_sigma_int)
-    
-    # NOW: ASSUMES targets are surface grids -- if target initialized the same way, should be the same surface grid!
-    val_x, val_y, val_z = sig_vwx2xyz(vlm_DL_sigma, wlm_DL_sigma, xlm_DL_sigma, theta, phi, sh)
-    DL_sigma = np.column_stack([val_x.reshape(-1), val_y.reshape(-1), val_z.reshape(-1)])
-
-    # TODO: need SHqst_to_point_cplx() implementation in C to do point-wise. 
-    # qlm_DL_sigma, slm_DL_sigma, tlm_DL_sigma = vwx2qst(vlm_DL_sigma, wlm_DL_sigma, xlm_DL_sigma, sh)
-    # trg_costheta = np.cos(trg_theta)
-    # DL_sigma = np.zeros((Ntrg,3), dtype = np.complex128)
-    # for trg_i in range(Ntrg):
-    #     val_r, val_t, val_p = sh.SHqst_to_point(qlm_DL_sigma[trg_i,:], slm_DL_sigma[trg_i,:], tlm_DL_sigma[trg_i,:], trg_costheta[trg_i], trg_phi[trg_i])
-    #     val_x, val_y, val_z = sph2cart(val_r, val_t, val_p, trg_theta[trg_i], trg_phi[trg_i]) 
-    #     DL_sigma = DL_sigma.at[trg_i,:].set(np.array([val_x, val_y, val_z]))
 
     return DL_sigma
 
@@ -342,9 +279,9 @@ def bio_onsurf_apply(sigma_tens: np.ndarray, theta: np.ndarray, phi: np.ndarray,
     xlm_op = sl_scal * xlm_SL_sigma + dl_scal * xlm_DL_sigma
 
     vx,vy,vz = sig_vwx2xyz(vlm_op,wlm_op,xlm_op,theta,phi,sh)
-    vx = vx + 0.5* sgn * sigma_x
-    vy = vy + 0.5 * sgn * sigma_y
-    vz = vz + 0.5 * sgn * sigma_z
+    vx = vx + 0.5 * sgn * dl_scal * sigma_x
+    vy = vy + 0.5 * sgn * dl_scal * sigma_y
+    vz = vz + 0.5 * sgn * dl_scal * sigma_z
     V = np.stack([vx, vy, vz], axis=2)
     return V.flatten()
 
@@ -379,13 +316,13 @@ def compute_field(trg: np.ndarray, src: np.ndarray, force: np.ndarray) -> np.nda
     
 if __name__ == "__main__":
     # Make a sphere
-    lmax = 16
+    lmax = 36
     center = np.array([0.,0.,0.])
     radius = 1.
     S = build_sphere(center, radius)
     S, sh = quadr_sphere(S, lmax)
-    # Lap op far
-    ext = True
+    # Stk op far
+    ext = False
     if ext:
         Rtrg = radius * 1.025
         sgn = 1.0 # exterior problem, sgn = +1
@@ -460,11 +397,14 @@ if __name__ == "__main__":
     # DLexp_x,DLexp_y,DLexp_z = sig_vwx2xyz(vlmexp, wlmexp, xlmexp, theta, phi, sh)
     # print(f"DL[W2-2] err at Rtrg = {Rtrg} is: {np.linalg.norm(DLexp_x-DLsigma[:,:,0,0])}, {np.linalg.norm(DLexp_y-DLsigma[:,:,1,0])}, {np.linalg.norm(DLexp_z-DLsigma[:,:,2,0])}")
 
-
-    # TODO: solver ran quickly, residue small, but off-surface eval different from exact field.
     # TEST 2: Manufactored solutions with 1 stokeslet inside.
-    ptsrc = np.array([[0.1,0.3,0.15],[-0.35,0.2,0.]]) # shifted source to avoid constant potential on all of S
-    force = np.array([[1,1,1],[-1,-1,-1]])
+    if ext:
+        ptsrc = np.array([[0.1,0.3,0.15],[-0.35,0.2,0.]]) # shifted source to avoid constant potential on all of S
+        # force = np.array([[1,1,1],[-1,-1,-1]])
+        force = np.array([[1,1,1],[-1,0,0]])
+    else:
+        ptsrc = np.array([[1.3,1.75,-2],[-1.3,-1.75,2]])
+        force = np.array([[1,1,1],[-1,-1,-1]]) # Need to have net force zero over the sphere
 
     x = S["Xcart"][:,:,0]
     y = S["Xcart"][:,:,1]
@@ -479,22 +419,16 @@ if __name__ == "__main__":
         theta = theta,
         phi = phi,
         sh=sh,
-        sl_scal=1.0, 
-        dl_scal=1.0, 
+        sl_scal=sl_scal, 
+        dl_scal=dl_scal, 
         sgn=sgn
     )
     total_dofs = S["Xcart"].size
     gmres_func = scipy.sparse.linalg.LinearOperator((total_dofs, total_dofs), \
                                                     matvec=StkK_apply, \
                                                     dtype=np.complex128)
-    time_solver_start = time.time()
     x, info = scipy.sparse.linalg.gmres(gmres_func, BC_pot.flatten(), x0=np.zeros(total_dofs, dtype=np.complex128), \
-                                        atol = 1e-12, rtol = 1e-10, maxiter=200)
-    time_solver_end = time.time()
-    print(f"Timing results solve: {time_solver_end - time_solver_start}")
-
-    # sig_fromBC = solution.value 
-    # stats = solution.stats
+                                        atol = 1e-14, rtol = 1e-13, maxiter=200)
     sig_fromBC = x.reshape(theta.shape[0], theta.shape[1], 3)
     # Manually check residual
     bc_check = bio_onsurf_apply(x, theta, phi, sh, sl_scal, dl_scal, sgn)
