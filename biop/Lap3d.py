@@ -151,7 +151,7 @@ def bio_onsurf_apply(sigma: jax.Array, sh: shtns.sht, sl_scal: float, dl_scal: f
     qlm_sigma = sh.analys_cplx_jax(sigma)
     qlm_KL_sigma = bio_diag_apply(qlm_sigma, sh, sl_scal, dl_scal)
     KL_sigma = sh.synth_cplx_jax(qlm_KL_sigma)
-    return sgn * 0.5 * sigma + KL_sigma
+    return 0.5 * dl_scal * sgn * sigma + KL_sigma
 
 def bio_offsurf_apply(trg: jax.Array, S: SphereDict, sh: shtns.sht, sl_scal: float, dl_scal: float) -> jax.Array:
     SLsigma = Lap3d_sl(trg, S, sh)
@@ -170,7 +170,7 @@ if __name__ == "__main__":
     S = build_sphere(center, radius)
     S, sh = quadr_sphere(S, lmax)
     # Lap op far
-    ext = True
+    ext = False
     if ext:
         Rtrg = radius * 1.00025
         sgn = 1.0 # exterior problem, sgn = +1
@@ -204,8 +204,12 @@ if __name__ == "__main__":
 
 
     # TEST 2: Manufactured solutions
-    ptsrc = jnp.array([[0.1,0.3,0.15]]) # shifted source to avoid constant potential on all of S
-    force = jnp.ones((1,1)) 
+    if ext:
+        ptsrc = jnp.array([[0.1,0.3,0.15]]) # shifted source to avoid constant potential on all of S
+        force = jnp.ones((1,1)) 
+    else:
+        ptsrc = jnp.array([[1.5,2,1.5],[-1.5,-2,-1.5]])
+        force = jnp.array([[1],[-1]])
 
     x = S["Xcart"][:,:,0]
     y = S["Xcart"][:,:,1]
@@ -218,8 +222,8 @@ if __name__ == "__main__":
     LapK_apply = partial(
         bio_onsurf_apply,
         sh=sh,
-        sl_scal=1.0, 
-        dl_scal=1.0, 
+        sl_scal=sl_scal, 
+        dl_scal=dl_scal, 
         sgn=sgn
     )
     gmres_func = lx.FunctionLinearOperator(

@@ -49,8 +49,8 @@ def test(lmax: int):
     LapK_apply = partial(
         bio_onsurf_apply,
         sh=sh,
-        sl_scal=1.0, 
-        dl_scal=1.0, 
+        sl_scal=sl_scal, 
+        dl_scal=dl_scal, 
         sgn=sgn
     )
     gmres_func = lx.FunctionLinearOperator(
