@@ -18,7 +18,7 @@ def test(lmax: int):
     S = build_sphere(center, radius)
     S, sh = quadr_sphere(S, lmax)
     # Stk op far
-    ext = True
+    ext = False
     if ext:
         Rtrg = radius * 1.025
         sgn = 1.0 # exterior problem, sgn = +1
@@ -77,8 +77,7 @@ def test(lmax: int):
     # Compare with true solution at target sphere
     S = set_density(S, sig_fromBC[:,:,0], sig_fromBC[:,:,1], sig_fromBC[:,:,2])
     time_eval_start = time.time()
-    Ksigma = bio_offsurf_apply(np.array([Rtrg]), S, sh, sl_scal, dl_scal) 
-    Ksigma = Ksigma[:,:,:,0]
+    Ksigma = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal) 
     time_eval_end = time.time()
     time_eval = time_eval_end - time_eval_start
 
@@ -96,12 +95,12 @@ def test(lmax: int):
     return time_solver, time_eval
 
 if __name__ == "__main__":
+    pmin = 16
+    pmax = 1000
+    pstep = 50
     # pmin = 4
-    # pmax = 1000
-    # pstep = 25
-    pmin = 4
-    pmax = 64
-    pstep = 4
+    # pmax = 40
+    # pstep = 4
     lmax_list = np.arange(pmin, pmax, pstep, dtype = int)
     Np = len(lmax_list)
     Tsolve = np.zeros((Np,))
@@ -113,5 +112,7 @@ if __name__ == "__main__":
 
     plt.plot(lmax_list, Tsolve, 'k*', label="gmres")
     plt.plot(lmax_list, Teval, 'b*', label="off-surf eval")
+    plt.xlabel("lmax")
+    plt.ylabel("Time (s)")
     plt.legend()
-    plt.savefig('Stk3d_timing.png')
+    plt.savefig('Stk3d_timing_int.png')

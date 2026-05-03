@@ -156,9 +156,8 @@ def Stk3d_dl_r(trg_r: np.ndarray, S: SphereDict, sh: shtns.sht) -> np.ndarray:
 
         diag_V2W_int = (l_vals+1.0) * (l_vals + 2.0) / (2.0*l_vals+1.0) # additional coeff for V<-W and W->V
         diag_W2V_ext = 2. * l_vals * (l_vals - 1.0) / (4.0*l_vals+2.0)
-        rpowers_V2W_int = trg_dr ** (l_vals + 1.0) - trg_dr ** (l_vals - 1.0)
-        # rpowers_W2V_ext = - trg_dr ** (-l_vals - 2.0) + trg_dr ** (-l_vals) # NOTE: TYPO IN PAPER
-        rpowers_W2V_ext = trg_dr ** (-l_vals - 2.0) - trg_dr ** (-l_vals) # NOTE: this make exterior manufactured solutions correct, so maybe no typo here.
+        rpowers_V2W_int = - trg_dr ** (l_vals + 1.0) + trg_dr ** (l_vals - 1.0)
+        rpowers_W2V_ext = trg_dr ** (-l_vals - 2.0) - trg_dr ** (-l_vals) 
         V2Wlm_DL_sigma_int = rpowers_V2W_int * diag_V2W_int * vlm_sigma
         W2Vlm_DL_sigma_ext = rpowers_W2V_ext * diag_W2V_ext * wlm_sigma
 
@@ -168,6 +167,125 @@ def Stk3d_dl_r(trg_r: np.ndarray, S: SphereDict, sh: shtns.sht) -> np.ndarray:
 
         val_x, val_y, val_z = sig_vwx2xyz(vlm_DL_sigma, wlm_DL_sigma, xlm_DL_sigma, theta, phi, sh)
         DL_sigma[:,:,:,ri] = np.stack([val_x, val_y, val_z], axis=2)
+
+    return DL_sigma
+
+def Stk3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns.sht) -> np.ndarray:
+    if S["lmax"] != sh.lmax:
+        print("S lmax does not match sht's lmax, reform sht.")
+        sh = shtns.sht(S["lmax"], S["lmax"])
+
+    Sigma_x = S["Sigma"][:,:,0] 
+    Sigma_y = S["Sigma"][:,:,1] 
+    Sigma_z = S["Sigma"][:,:,2] 
+    theta = S["Xsph"][:,:,0]
+    phi = S["Xsph"][:,:,1]
+    vlm_sigma, wlm_sigma, xlm_sigma = sig_xyz2vwx(Sigma_x, Sigma_y, Sigma_z, theta, phi, sh)
+    
+    trg_dr = Strg["r"]
+    l_vals = np.asarray(sh.zl, dtype=np.float64) # shape ((p+1)^2, )
+    diag_V, diag_W, diag_X = Stk3d_sl_VWX_diag(sh) # Coeff for V-V, W-W, X-X matches for SL
+    rpowers_V_ext = trg_dr ** (-l_vals-2.0) # Ntrg x Nlm
+    rpowers_V_int = trg_dr ** (l_vals+1.0) 
+    vlm_SL_sigma_ext = rpowers_V_ext * diag_V * vlm_sigma 
+    vlm_SL_sigma_int = rpowers_V_int * diag_V * vlm_sigma
+
+    rpowers_W_ext = trg_dr ** (-l_vals)
+    rpowers_W_int = trg_dr ** (l_vals - 1.0)
+    wlm_SL_sigma_ext = rpowers_W_ext * diag_W * wlm_sigma 
+    wlm_SL_sigma_int = rpowers_W_int * diag_W * wlm_sigma 
+
+    rpowers_X_ext = trg_dr ** (-l_vals - 1.0)
+    rpowers_X_int = trg_dr ** (l_vals)
+    xlm_SL_sigma_ext = rpowers_X_ext * diag_X * xlm_sigma
+    xlm_SL_sigma_int = rpowers_X_int * diag_X * xlm_sigma
+
+    diag_V2W_int = (l_vals+1.0) / (4.0*l_vals+2.0) # additional coeff for V<-W, W<-V
+    diag_W2V_ext = l_vals / (4.0*l_vals+2.0) # additional coeff for V<-W, W<-V
+    rpowers_V2W_int = trg_dr ** (l_vals+1.0) - trg_dr ** (l_vals - 1.0) # NOTE: TYPO IN PAPER
+    rpowers_W2V_ext = trg_dr ** (-l_vals - 2.0) - trg_dr ** (-l_vals)
+    V2Wlm_SL_sigma_int = rpowers_V2W_int * diag_V2W_int * vlm_sigma
+    W2Vlm_SL_sigma_ext = rpowers_W2V_ext * diag_W2V_ext * wlm_sigma
+
+    vlm_SL_sigma = vlm_SL_sigma_ext + W2Vlm_SL_sigma_ext if trg_dr > S['r'] else vlm_SL_sigma_int 
+    wlm_SL_sigma = wlm_SL_sigma_ext if trg_dr > S['r'] else wlm_SL_sigma_int + V2Wlm_SL_sigma_int
+    xlm_SL_sigma = xlm_SL_sigma_ext if trg_dr > S['r'] else xlm_SL_sigma_int
+
+    theta_trg = Strg["Xsph"][:,:,0]
+    phi_trg = Strg["Xsph"][:,:,1]
+    # Interpolate to new grid by padding or truncating coefficients to Strg['lmax']
+    nlm_src = sh.nlm_cplx
+    nlm_trg = shtrg.nlm_cplx
+    if nlm_trg > nlm_src:
+        vlm_SL_sigma = np.pad(vlm_SL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+        wlm_SL_sigma = np.pad(wlm_SL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+        xlm_SL_sigma = np.pad(xlm_SL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+    elif nlm_trg < nlm_src:
+        vlm_SL_sigma = vlm_SL_sigma[:nlm_trg]
+        wlm_SL_sigma = wlm_SL_sigma[:nlm_trg]
+        xlm_SL_sigma = xlm_SL_sigma[:nlm_trg]
+    val_x, val_y, val_z = sig_vwx2xyz(vlm_SL_sigma, wlm_SL_sigma, xlm_SL_sigma, theta_trg, phi_trg, shtrg)
+    SL_sigma = np.stack([val_x, val_y, val_z], axis=2)
+
+    return SL_sigma
+
+def Stk3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns.sht) -> np.ndarray:
+    if S["lmax"] != sh.lmax:
+        print("S lmax does not match sht's lmax, reform sht.")
+        sh = shtns.sht(S["lmax"], S["lmax"])
+
+    Sigma_x = S["Sigma"][:,:,0] 
+    Sigma_y = S["Sigma"][:,:,1] 
+    Sigma_z = S["Sigma"][:,:,2] 
+    theta = S["Xsph"][:,:,0]
+    phi = S["Xsph"][:,:,1]
+    vlm_sigma, wlm_sigma, xlm_sigma = sig_xyz2vwx(Sigma_x, Sigma_y, Sigma_z, theta, phi, sh)
+
+    trg_dr = Strg["r"]
+    l_vals = np.asarray(sh.zl, dtype=np.float64) # shape ((p+1)^2, )
+    diag_V_ext, diag_W_ext, diag_X_ext, diag_V_int, diag_W_int, diag_X_int = Stk3d_dl_VWX_diag(sh) # Coeff for V-V, W-W, X-X matches for DL
+    
+    rpowers_V_ext = trg_dr ** (- l_vals - 2.0) # Ntrg x Nlm
+    rpowers_V_int = trg_dr ** (l_vals + 1.0) 
+    vlm_DL_sigma_ext = rpowers_V_ext * diag_V_ext * vlm_sigma # resulting Vnm coeff from sigma_Vnm terms (DL[V] = aV + bW)
+    vlm_DL_sigma_int = rpowers_V_int * diag_V_int * vlm_sigma
+
+    rpowers_W_ext = trg_dr ** (-l_vals)
+    rpowers_W_int = trg_dr ** (l_vals - 1.0)
+    wlm_DL_sigma_ext = rpowers_W_ext * diag_W_ext * wlm_sigma
+    wlm_DL_sigma_int = rpowers_W_int * diag_W_int * wlm_sigma 
+
+    rpowers_X_ext = trg_dr ** (-l_vals - 1.0)
+    rpowers_X_int = trg_dr ** (l_vals)
+    xlm_DL_sigma_ext = rpowers_X_ext * diag_X_ext * xlm_sigma
+    xlm_DL_sigma_int = rpowers_X_int * diag_X_int * xlm_sigma
+
+    diag_V2W_int = (l_vals+1.0) * (l_vals + 2.0) / (2.0*l_vals+1.0) # additional coeff for V<-W and W->V
+    diag_W2V_ext = 2. * l_vals * (l_vals - 1.0) / (4.0*l_vals+2.0)
+    rpowers_V2W_int = - trg_dr ** (l_vals + 1.0) + trg_dr ** (l_vals - 1.0)
+    rpowers_W2V_ext = trg_dr ** (-l_vals - 2.0) - trg_dr ** (-l_vals) 
+    V2Wlm_DL_sigma_int = rpowers_V2W_int * diag_V2W_int * vlm_sigma
+    W2Vlm_DL_sigma_ext = rpowers_W2V_ext * diag_W2V_ext * wlm_sigma
+
+    vlm_DL_sigma = vlm_DL_sigma_ext + W2Vlm_DL_sigma_ext if trg_dr > S['r'] else vlm_DL_sigma_int
+    wlm_DL_sigma = wlm_DL_sigma_ext if trg_dr > S['r'] else wlm_DL_sigma_int + V2Wlm_DL_sigma_int
+    xlm_DL_sigma = xlm_DL_sigma_ext if trg_dr > S['r'] else xlm_DL_sigma_int
+
+    theta_trg = Strg["Xsph"][:,:,0]
+    phi_trg = Strg["Xsph"][:,:,1]
+    # Interpolate to new grid by padding or truncating coefficients to Strg['lmax']
+    nlm_src = sh.nlm_cplx
+    nlm_trg = shtrg.nlm_cplx
+    if nlm_trg > nlm_src:
+        vlm_DL_sigma = np.pad(vlm_DL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+        wlm_DL_sigma = np.pad(wlm_DL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+        xlm_DL_sigma = np.pad(xlm_DL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+    elif nlm_trg < nlm_src:
+        vlm_DL_sigma = vlm_DL_sigma[:nlm_trg]
+        wlm_DL_sigma = wlm_DL_sigma[:nlm_trg]
+        xlm_DL_sigma = xlm_DL_sigma[:nlm_trg]
+    val_x, val_y, val_z = sig_vwx2xyz(vlm_DL_sigma, wlm_DL_sigma, xlm_DL_sigma, theta_trg, phi_trg, shtrg)
+    DL_sigma = np.stack([val_x, val_y, val_z], axis=2)
 
     return DL_sigma
 
@@ -288,6 +406,13 @@ def bio_onsurf_apply(sigma_tens: np.ndarray, theta: np.ndarray, phi: np.ndarray,
 def bio_offsurf_apply(Rtrg_lst: np.ndarray, S: SphereDict, sh: shtns.sht, sl_scal: float, dl_scal: float) -> np.ndarray:
     SLsigma = Stk3d_sl_r(Rtrg_lst, S, sh) 
     DLsigma = Stk3d_dl_r(Rtrg_lst, S, sh) 
+    Ksigma = sl_scal * SLsigma + dl_scal * DLsigma
+    return Ksigma
+
+# Need to accomodate different ordered spheres for target. leave the looping over differetn targets to outside, plug in one target sphere and one source.
+def bio_offsurf_apply_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns.sht, sl_scal: float, dl_scal: float) -> np.ndarray:
+    SLsigma = Stk3d_sl_r_1sph(Strg, shtrg, S, sh) 
+    DLsigma = Stk3d_dl_r_1sph(Strg, shtrg, S, sh) 
     Ksigma = sl_scal * SLsigma + dl_scal * DLsigma
     return Ksigma
 
@@ -442,8 +567,7 @@ if __name__ == "__main__":
     trg_sphere2 = np.column_stack([np.reshape(xtrg,-1), np.reshape(ytrg,-1), np.reshape(ztrg,-1)])
     S = set_density(S, sig_fromBC[:,:,0], sig_fromBC[:,:,1], sig_fromBC[:,:,2])
     time_eval_start = time.time()
-    Ksigma = bio_offsurf_apply(np.array([Rtrg]), S, sh, sl_scal, dl_scal) # trg_sphere2 reshaped to be Ntrg x 3, so output is Ntrg x 1.
-    Ksigma = Ksigma[:,:,:,0]
+    Ksigma = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal) # trg_sphere2 reshaped to be Ntrg x 3, so output is Ntrg x 1.
     time_eval_end = time.time()
     print(f"Timing results off-surface eval: {time_eval_end - time_eval_start}")
 
