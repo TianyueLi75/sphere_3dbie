@@ -11,6 +11,12 @@ import shtns
 import time
 import matplotlib.pyplot as plt
 
+class IterationCounter:
+    def __init__(self):
+        self.count = 0
+    def __call__(self, rk=None):
+        self.count += 1
+
 def test(lmax: int):
     # Geometry setup
     center = np.array([0.,0.,0.])
@@ -18,7 +24,7 @@ def test(lmax: int):
     S = build_sphere(center, radius)
     S, sh = quadr_sphere(S, lmax)
     # Stk op far
-    ext = False
+    ext = True
     if ext:
         Rtrg = radius * 1.025
         sgn = 1.0 # exterior problem, sgn = +1
@@ -62,9 +68,10 @@ def test(lmax: int):
     gmres_func = scipy.sparse.linalg.LinearOperator((total_dofs, total_dofs), \
                                                     matvec=StkK_apply, \
                                                     dtype=np.complex128)
+    counter = IterationCounter()
     time_solver_start = time.time()
     x, info = scipy.sparse.linalg.gmres(gmres_func, BC_pot.flatten(), x0=np.zeros(total_dofs, dtype=np.complex128), \
-                                        atol = 1e-14, rtol = 1e-13, maxiter=200)
+                                        atol = 1e-14, rtol = 1e-13, maxiter=200, callback = counter)
     time_solver_end = time.time()
     time_solver = time_solver_end - time_solver_start
 
@@ -72,10 +79,19 @@ def test(lmax: int):
     # Manually check residual
     bc_check = bio_onsurf_apply(x, theta, phi, sh, sl_scal, dl_scal, sgn)
     resid_gmres = np.linalg.norm(bc_check - BC_pot.flatten())
-    print("Checking residual of solve: {a}, exitcode (0:successful): {b}".format(a=resid_gmres, b=info))
+    print("Checking residual of solve: {a}, exitcode (0:successful): {b}; Niter = {c}".format(a=resid_gmres, b=info, c=counter.count))
+
+    time_solver_diag_start = time.time()
+    sigma_solution = stokes_onsurf_diag_solve(BC_pot, theta, phi, sh, sl_scal, dl_scal, sgn)
+    time_solver_diag_end = time.time()
+    time_solver_diag = time_solver_diag_end - time_solver_diag_start
+    bc_check_diag = bio_onsurf_apply(sigma_solution.flatten(), theta, phi, sh, sl_scal, dl_scal, sgn)
+    resid_diag = np.linalg.norm(bc_check_diag - BC_pot.flatten())
+    print("Checking residual of direct solve: {a}".format(a=resid_diag))
 
     # Compare with true solution at target sphere
-    S = set_density(S, sig_fromBC[:,:,0], sig_fromBC[:,:,1], sig_fromBC[:,:,2])
+    # S = set_density(S, sig_fromBC[:,:,0], sig_fromBC[:,:,1], sig_fromBC[:,:,2])
+    S = set_density(S, sigma_solution[:,:,0], sigma_solution[:,:,1], sigma_solution[:,:,2])
     time_eval_start = time.time()
     Ksigma = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal) 
     time_eval_end = time.time()
@@ -92,7 +108,7 @@ def test(lmax: int):
     diff = np.max(true_field - Ksigma) / np.max(true_field)
     print("At target sphere Rtrg = {a}, max true field is {d}, relative error from true field using lmax = {b} is {c}".format(a=Rtrg, d=np.max(true_field), b=lmax, c=diff))
 
-    return time_solver, time_eval
+    return time_solver, time_solver_diag, time_eval
 
 if __name__ == "__main__":
     pmin = 16
@@ -104,15 +120,18 @@ if __name__ == "__main__":
     lmax_list = np.arange(pmin, pmax, pstep, dtype = int)
     Np = len(lmax_list)
     Tsolve = np.zeros((Np,))
+    Tsolve_diag = np.zeros((Np,))
     Teval = np.zeros((Np,))
     for li in range(Np):
-        t1, t2 = test(lmax_list[li])
+        t1, t2, t3 = test(lmax_list[li])
         Tsolve[li] = t1
-        Teval[li] = t2
+        Tsolve_diag[li] = t2
+        Teval[li] = t3
 
     plt.plot(lmax_list, Tsolve, 'k*', label="gmres")
-    plt.plot(lmax_list, Teval, 'b*', label="off-surf eval")
+    plt.plot(lmax_list, Tsolve_diag, 'k+', label="direct")
+    plt.plot(lmax_list, Teval, 'ko', label="off-surf eval")
     plt.xlabel("lmax")
     plt.ylabel("Time (s)")
     plt.legend()
-    plt.savefig('Stk3d_timing_int.png')
+    plt.savefig('Stk3d_timing_ext.png')

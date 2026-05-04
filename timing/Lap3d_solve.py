@@ -80,47 +80,71 @@ def test(lmax: int):
     resid_gmres = jnp.linalg.norm(bc_check - BC_pot)
     jax.debug.print("Checking residual of solve: {a}, number of iterations needed: {b}", a=resid_gmres, b=stats["num_steps"])
 
+    sigma_solution = bio_onsurf_diag_solve(
+        bc_pot=BC_pot,
+        sh=sh,
+        sl_scal=sl_scal,
+        dl_scal=dl_scal,
+        sgn=sgn
+    )
+    time_solver_diag_start = time.time()
+    sigma_solution = bio_onsurf_diag_solve(
+        bc_pot=BC_pot,
+        sh=sh,
+        sl_scal=sl_scal,
+        dl_scal=dl_scal,
+        sgn=sgn
+    )
+    time_solver_diag_end = time.time()
+    bc_check_diag = bio_onsurf_apply(sigma_solution, sh, sl_scal, dl_scal, sgn)
+    resid_diag = jnp.linalg.norm(bc_check_diag - BC_pot)
+    jax.debug.print("Checking residual of diag solve: {a}", a=resid_diag)
+    time_solver_diag = time_solver_diag_end - time_solver_diag_start
 
-    # Compare with true solution at target sphere
-    xtrg = Strg["Xcart"][:,:,0] 
-    ytrg = Strg["Xcart"][:,:,1]
-    ztrg = Strg["Xcart"][:,:,2]
-    trg_sphere2 = jnp.column_stack([jnp.reshape(xtrg,-1), jnp.reshape(ytrg,-1), jnp.reshape(ztrg,-1)])
-    S = set_density(S, sig_fromBC)
-    Ksigma = bio_offsurf_apply(trg_sphere2, S, sh, sl_scal, dl_scal) # trg_sphere2 reshaped to be Ntrg x 3, so output is Ntrg x 1.
-
+    # Compare with true solution at the target sphere
+    # S = set_density(S, sig_fromBC)
+    S = set_density(S, sigma_solution)
     time_eval_start = time.time()
-    Ksigma = bio_offsurf_apply(trg_sphere2, S, sh, sl_scal, dl_scal) # trg_sphere2 reshaped to be Ntrg x 3, so output is Ntrg x 1.
+    Ksigma = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal) # output is ntheta x nphi
     Ksigma.block_until_ready()
     time_eval_end = time.time()
     time_eval = time_eval_end - time_eval_start
 
+    xtrg = Strg["Xcart"][:,:,0] 
+    ytrg = Strg["Xcart"][:,:,1]
+    ztrg = Strg["Xcart"][:,:,2]
+    trg_sphere2 = jnp.column_stack([jnp.reshape(xtrg,-1), jnp.reshape(ytrg,-1), jnp.reshape(ztrg,-1)])
     true_pot = compute_potential(trg_sphere2, ptsrc, force) # true_pot also computed as Ntrg x 1
     # For scalar electric potential calculation, only real values
-    Ksigma = jnp.real(Ksigma)
+    Ksigma = jnp.real(jnp.reshape(Ksigma, (-1, 1)))
     true_pot = jnp.real(true_pot)
     diff = jnp.max(true_pot - Ksigma) / jnp.max(true_pot )
     jax.debug.print("At target sphere Rtrg = {a}, max relative error from true potential using lmax = {b} is {c}", a=Rtrg, b=lmax, c=diff)
 
-    return time_solver, time_eval
+    return time_solver, time_solver_diag, time_eval
 
 if __name__ == "__main__":
     pmin = 4
     pmax = 1000
-    pstep = 25
+    pstep = 50
     # pmin = 4
     # pmax = 64
     # pstep = 4
     lmax_list = jnp.arange(pmin, pmax, pstep, dtype = int)
     Np = len(lmax_list)
     Tsolve = np.zeros((Np,))
+    Tsolve_diag = np.zeros((Np,))
     Teval = np.zeros((Np,))
     for li in range(Np):
-        t1, t2 = test(lmax_list[li])
+        t1, t2, t3 = test(lmax_list[li])
         Tsolve[li] = t1
-        Teval[li] = t2
+        Tsolve_diag[li] = t2
+        Teval[li] = t3
 
     plt.plot(lmax_list, Tsolve, 'k*', label="gmres")
-    plt.plot(lmax_list, Teval, 'b*', label="off-surf eval")
+    plt.plot(lmax_list, Tsolve_diag, 'k+', label="direct")
+    plt.plot(lmax_list, Teval, 'ko', label="off-surf eval")
+    plt.xlabel("lmax")
+    plt.ylabel("Time (s)")
     plt.legend()
-    plt.savefig('Lap3d_timing.png')
+    plt.savefig('Lap3d_timing_ext.png')

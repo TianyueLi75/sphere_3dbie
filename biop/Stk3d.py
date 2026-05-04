@@ -403,6 +403,66 @@ def bio_onsurf_apply(sigma_tens: np.ndarray, theta: np.ndarray, phi: np.ndarray,
     V = np.stack([vx, vy, vz], axis=2)
     return V.flatten()
 
+def stokes_onsurf_diag_solve(
+    bc_vec: np.ndarray,        # Shape (Ntheta, Nphi, 3)
+    theta: np.ndarray,
+    phi: np.ndarray,
+    sh: shtns.sht,
+    sl_scal: float,
+    dl_scal: float,
+    sgn: float
+) -> np.ndarray:
+    """
+    Directly solves the Stokes BIO equation using the VWX diagonal property.
+    Equation: [0.5 * dl_scal * sgn * I + KL] sigma = bc_vec
+    """
+    # 1. Decompose the vector BC into V, W, X spectral coefficients
+    # Expects bc_vec components at [..., 0], [..., 1], [..., 2]
+    vlm_bc, wlm_bc, xlm_bc = sig_xyz2vwx(
+        bc_vec[..., 0], bc_vec[..., 1], bc_vec[..., 2], 
+        theta, phi, sh
+    )
+
+    # 2. Get the diagonal spectra for SL and DL
+    diag_V_sl, diag_W_sl, diag_X_sl = Stk3d_sl_VWX_diag(sh)
+    (diag_V_ext, diag_W_ext, diag_X_ext, 
+     diag_V_int, diag_W_int, diag_X_int) = Stk3d_dl_VWX_diag(sh)
+
+    # Principal Value of K = 0.5 * (Interior + Exterior)
+    diag_V_k = 0.5 * (diag_V_int + diag_V_ext)
+    diag_W_k = 0.5 * (diag_W_int + diag_W_ext)
+    diag_X_k = 0.5 * (diag_X_int + diag_X_ext)
+
+    # 3. Construct the full diagonal for each mode
+    # Operator = (0.5 * dl_scal * sgn) * I + dl_scal * K + sl_scal * SL
+    id_term = 0.5 * dl_scal * sgn
+    
+    op_diag_V = id_term + (dl_scal * diag_V_k) + (sl_scal * diag_V_sl)
+    op_diag_W = id_term + (dl_scal * diag_W_k) + (sl_scal * diag_W_sl)
+    op_diag_X = id_term + (dl_scal * diag_X_k) + (sl_scal * diag_X_sl)
+
+    # 4. Solve in spectral space with null-space handling
+    # Using a small epsilon to avoid division by zero in null spaces (like l=0 or l=1)
+    eps = 1e-14
+    
+    def safe_div(bc_lm, op_diag):
+        safe = np.where(np.abs(op_diag) > eps, op_diag, 1.0+0j)
+        res = bc_lm / safe
+        # Return BC value where diag is zero (null space)
+        return np.where(np.abs(op_diag) <= eps, bc_lm, res)
+
+    vlm_sigma = safe_div(vlm_bc, op_diag_V)
+    wlm_sigma = safe_div(wlm_bc, op_diag_W)
+    xlm_sigma = safe_div(xlm_bc, op_diag_X)
+
+    # 5. Transform back to Cartesian physical space
+    sig_x, sig_y, sig_z = sig_vwx2xyz(
+        vlm_sigma, wlm_sigma, xlm_sigma, 
+        theta, phi, sh
+    )
+    
+    return np.stack([sig_x, sig_y, sig_z], axis=-1)
+
 def bio_offsurf_apply(Rtrg_lst: np.ndarray, S: SphereDict, sh: shtns.sht, sl_scal: float, dl_scal: float) -> np.ndarray:
     SLsigma = Stk3d_sl_r(Rtrg_lst, S, sh) 
     DLsigma = Stk3d_dl_r(Rtrg_lst, S, sh) 
@@ -437,7 +497,7 @@ def compute_field(trg: np.ndarray, src: np.ndarray, force: np.ndarray) -> np.nda
     u_contrib = (1/(8*np.pi)) * (force_expanded / r_norm + dot_prod * r_hat / (r_norm**2))
     u = np.sum(u_contrib, axis=1)  # Ntrg x 3
     
-    return u
+    return u.astype(np.complex128)
     
 if __name__ == "__main__":
     # Make a sphere
@@ -560,12 +620,18 @@ if __name__ == "__main__":
     resid_gmres = np.linalg.norm(bc_check - BC_pot.flatten())
     print("Checking residual of solve: {a}, exitcode (0:successful): {b}".format(a=resid_gmres, b=info))
 
+    sigma_solution = stokes_onsurf_diag_solve(BC_pot, theta, phi, sh, sl_scal, dl_scal, sgn)
+    bc_check_diag = bio_onsurf_apply(sigma_solution.flatten(), theta, phi, sh, sl_scal, dl_scal, sgn)
+    resid_diag = np.linalg.norm(bc_check_diag - BC_pot.flatten())
+    print("Checking residual of direct solve: {a}".format(a=resid_diag))
+
     # Compare with true solution at target sphere
     xtrg = Strg["Xcart"][:,:,0] 
     ytrg = Strg["Xcart"][:,:,1]
     ztrg = Strg["Xcart"][:,:,2]
     trg_sphere2 = np.column_stack([np.reshape(xtrg,-1), np.reshape(ytrg,-1), np.reshape(ztrg,-1)])
-    S = set_density(S, sig_fromBC[:,:,0], sig_fromBC[:,:,1], sig_fromBC[:,:,2])
+    # S = set_density(S, sig_fromBC[:,:,0], sig_fromBC[:,:,1], sig_fromBC[:,:,2])
+    S = set_density(S, sigma_solution[:,:,0], sigma_solution[:,:,1], sigma_solution[:,:,2])
     time_eval_start = time.time()
     Ksigma = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal) # trg_sphere2 reshaped to be Ntrg x 3, so output is Ntrg x 1.
     time_eval_end = time.time()

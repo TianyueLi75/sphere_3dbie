@@ -112,6 +112,70 @@ def Lap3d_dl(trg: jax.Array, S: SphereDict, sh: shtns.sht) -> jax.Array:
 
     return DL_sigma
 
+def Lap3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns.sht) -> jax.Array:
+    if S["lmax"] != sh.lmax:
+        print("S lmax does not match sht's lmax, reform sht.")
+        sh = shtns.sht(S["lmax"], S["lmax"])
+
+    Sigma = S["Sigma"][:,:,0] # scalar operator, so only take Sigma_x
+    qlm_sigma = sh.analys_cplx_jax(Sigma)
+
+    trg_dr = Strg["r"]
+    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64) # shape ((p+1)^2, )
+    diag = Lap3d_sl_diag(sh)
+    rpowers_ext = trg_dr ** (-l_vals-1) # Nlm
+    rpowers_int = trg_dr ** (l_vals) # Nlm
+    qlm_SL_sigma_ext = rpowers_ext * qlm_sigma * diag
+    qlm_SL_sigma_int = rpowers_int * qlm_sigma * diag
+
+    qlm_SL_sigma = qlm_SL_sigma_ext if trg_dr > S['r'] else qlm_SL_sigma_int
+
+    # Interpolate to new grid by padding or truncating coefficients to Strg['lmax']
+    nlm_src = sh.nlm_cplx
+    nlm_trg = shtrg.nlm_cplx
+    if nlm_trg > nlm_src:
+        qlm_SL_sigma = jnp.pad(qlm_SL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+    elif nlm_trg < nlm_src:
+        qlm_SL_sigma = qlm_SL_sigma[:nlm_trg]
+
+    theta_trg = Strg["Xsph"][:,:,0]
+    phi_trg = Strg["Xsph"][:,:,1]
+    SL_sigma = shtrg.synth_cplx_jax(qlm_SL_sigma)
+
+    return SL_sigma
+
+def Lap3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns.sht) -> jax.Array:
+    if S["lmax"] != sh.lmax:
+        print("S lmax does not match sht's lmax, reform sht.")
+        sh = shtns.sht(S["lmax"], S["lmax"])
+
+    Sigma = S["Sigma"][:,:,0] # scalar operator, so only take Sigma_x
+    qlm_sigma = sh.analys_cplx_jax(Sigma)
+
+    trg_dr = Strg["r"]
+    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
+    [diag_ext, diag_int] = Lap3d_dl_diag(sh)
+    rpowers_ext = trg_dr ** (-l_vals-1) # Nlm
+    rpowers_int = trg_dr ** (l_vals) # Nlm
+    qlm_DL_sigma_ext = rpowers_ext * qlm_sigma * diag_ext
+    qlm_DL_sigma_int = rpowers_int * qlm_sigma * diag_int
+
+    qlm_DL_sigma = qlm_DL_sigma_ext if trg_dr > S['r'] else qlm_DL_sigma_int
+
+    # Interpolate to new grid by padding or truncating coefficients to Strg['lmax']
+    nlm_src = sh.nlm_cplx
+    nlm_trg = shtrg.nlm_cplx
+    if nlm_trg > nlm_src:
+        qlm_DL_sigma = jnp.pad(qlm_DL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+    elif nlm_trg < nlm_src:
+        qlm_DL_sigma = qlm_DL_sigma[:nlm_trg]
+
+    theta_trg = Strg["Xsph"][:,:,0]
+    phi_trg = Strg["Xsph"][:,:,1]
+    DL_sigma = shtrg.synth_cplx_jax(qlm_DL_sigma)
+
+    return DL_sigma
+
 # Given source S with density <dens>, compute the Laplace potential at <trg>
 def compute_potential(trg: jax.Array, src: jax.Array, force: jax.Array) -> jax.Array:
     # trg and src are Ntrg x 3, Nsrc x 3 arrays of coordinates; force is Nsrc x 1 or Nsrc x , array of strengths
@@ -153,9 +217,60 @@ def bio_onsurf_apply(sigma: jax.Array, sh: shtns.sht, sl_scal: float, dl_scal: f
     KL_sigma = sh.synth_cplx_jax(qlm_KL_sigma)
     return 0.5 * dl_scal * sgn * sigma + KL_sigma
 
+@partial(jax.jit, static_argnames=["sh"])
+def bio_onsurf_diag_solve(
+    bc_pot: jax.Array, 
+    sh: shtns.sht, 
+    sl_scal: float, 
+    dl_scal: float, 
+    sgn: float
+) -> jax.Array:
+    """
+    Directly solves the BIO equation in the spectral domain.
+    Equation: [0.5 * dl_scal * sgn * I + KL] sigma = bc_pot
+    
+    Note: The l=0 mode is in the null space and is set to the BC value.
+    """
+    # 1. Transform Boundary Condition to Spectral Space (l, m)
+    qlm_bc = sh.analys_cplx_jax(bc_pot)
+    
+    # 2. Compute the diagonal spectra (eigenvalues) of the operators
+    # These are typically functions of 'l' only
+    sl_diag = Lap3d_sl_diag(sh)
+    [dl_diag_ext, dl_diag_int] = Lap3d_dl_diag(sh)
+    
+    # K operator is the average of internal and external limits (principal value)
+    k_diag = 0.5 * (dl_diag_ext + dl_diag_int)
+    
+    # 3. Construct the full diagonal of the operator
+    # The identity operator 'I' is simply 1.0 in spectral space
+    operator_diag = (0.5 * dl_scal * sgn) + (dl_scal * k_diag) + (sl_scal * sl_diag)
+    
+    # 4. Solve: sigma_lm = bc_lm / operator_diag_l
+    # The l=0 mode is in the null space; set it to the BC value
+    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
+    
+    # Create a safe diagonal by replacing near-zero entries with 1.0 (dummy) where we won't divide
+    safe_diag = jnp.where(jnp.abs(operator_diag) > 1e-14, operator_diag, 1.0)
+    qlm_sigma = qlm_bc / safe_diag
+    
+    # For l=0 modes (index 0), set to BC value (no amplification)
+    qlm_sigma = jnp.where(l_vals == 0.0, qlm_bc, qlm_sigma)
+    
+    # 5. Transform back to physical space
+    sigma = sh.synth_cplx_jax(qlm_sigma)
+    
+    return sigma
+
 def bio_offsurf_apply(trg: jax.Array, S: SphereDict, sh: shtns.sht, sl_scal: float, dl_scal: float) -> jax.Array:
     SLsigma = Lap3d_sl(trg, S, sh)
     DLsigma = Lap3d_dl(trg, S, sh)
+    Ksigma = sl_scal * SLsigma + dl_scal * DLsigma 
+    return Ksigma
+
+def bio_offsurf_apply_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns.sht, sl_scal: float, dl_scal: float) -> jax.Array:
+    SLsigma = Lap3d_sl_r_1sph(Strg, shtrg, S, sh)
+    DLsigma = Lap3d_dl_r_1sph(Strg, shtrg, S, sh)
     Ksigma = sl_scal * SLsigma + dl_scal * DLsigma 
     return Ksigma
 
@@ -248,7 +363,6 @@ if __name__ == "__main__":
     )
     time_solver_end2 = time.time()
     print(f"Timing results, first solve: {time_solver_end - time_solver_start}, second solve: {time_solver_end2 - time_solver_start2}")
-
     sig_fromBC = solution.value # This will have the ntheta x nphi grid size
     stats = solution.stats
     # Manually check residual
@@ -256,26 +370,46 @@ if __name__ == "__main__":
     resid_gmres = jnp.linalg.norm(bc_check - BC_pot)
     jax.debug.print("Checking residual of solve: {a}, number of iterations needed: {b}", a=resid_gmres, b=stats["num_steps"])
 
+    sigma_solution = bio_onsurf_diag_solve(
+        bc_pot=BC_pot,
+        sh=sh,
+        sl_scal=sl_scal,
+        dl_scal=dl_scal,
+        sgn=sgn
+    )
+    time_solver_diag_start = time.time()
+    sigma_solution = bio_onsurf_diag_solve(
+        bc_pot=BC_pot,
+        sh=sh,
+        sl_scal=sl_scal,
+        dl_scal=dl_scal,
+        sgn=sgn
+    )
+    time_solver_diag_end = time.time()
+    bc_check_diag = bio_onsurf_apply(sigma_solution, sh, sl_scal, dl_scal, sgn)
+    resid_diag = jnp.linalg.norm(bc_check_diag - BC_pot)
+    jax.debug.print("Checking residual of solve: {a}, time of solve: {b}", a=resid_diag, b=time_solver_diag_end - time_solver_diag_start)
 
     # Compare with true solution at target sphere
     xtrg = Strg["Xcart"][:,:,0] 
     ytrg = Strg["Xcart"][:,:,1]
     ztrg = Strg["Xcart"][:,:,2]
     trg_sphere2 = jnp.column_stack([jnp.reshape(xtrg,-1), jnp.reshape(ytrg,-1), jnp.reshape(ztrg,-1)])
-    S = set_density(S, sig_fromBC)
+    # S = set_density(S, sig_fromBC)
+    S = set_density(S, sigma_solution)
     time_eval_start = time.time()
-    Ksigma = bio_offsurf_apply(trg_sphere2, S, sh, sl_scal, dl_scal) # trg_sphere2 reshaped to be Ntrg x 3, so output is Ntrg x 1.
+    Ksigma = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal) # output is ntheta x nphi
     Ksigma.block_until_ready()
     time_eval_end = time.time()
     time_eval_start2 = time.time()
-    Ksigma = bio_offsurf_apply(trg_sphere2, S, sh, sl_scal, dl_scal) # trg_sphere2 reshaped to be Ntrg x 3, so output is Ntrg x 1.
+    Ksigma = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal) # output is ntheta x nphi
     Ksigma.block_until_ready()
     time_eval_end2 = time.time()
     print(f"Timing results, first off-surface eval: {time_eval_end - time_eval_start}, second eval: {time_eval_end2 - time_eval_start2}")
 
     true_pot = compute_potential(trg_sphere2, ptsrc, force) # true_pot also computed as Ntrg x 1
     # For scalar electric potential calculation, only real values
-    Ksigma = jnp.real(Ksigma)
+    Ksigma = jnp.real(jnp.reshape(Ksigma,(-1,1)))
     true_pot = jnp.real(true_pot)
     diff = jnp.max(true_pot - Ksigma) / jnp.max(true_pot )
     jax.debug.print("At target sphere Rtrg = {a}, relative error from true potential using lmax = {b} is {c}", a=Rtrg, b=lmax, c=diff)
