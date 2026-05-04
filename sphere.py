@@ -1,3 +1,9 @@
+"""
+Sphere Class: 
+    a dictionary object containing the 
+    geometry and density information on a sphere
+"""
+
 from typing import Dict, Any, Tuple
 
 import jax
@@ -11,9 +17,10 @@ jax.config.update("jax_enable_x64", True)  # support float64
 SphereDict = Dict[str, Any]
 
 def build_sphere(center: jax.Array, radius: float) -> SphereDict:
-    """ create a sphere dictionary with given center and radius. 
-    TODO: vectorized multi-sphere allow: ndarray of center and array of radii
+    """ 
+    create a sphere dictionary with given center and radius. 
     """
+
     return {
         "Xc": center,
         "r": radius,
@@ -21,18 +28,18 @@ def build_sphere(center: jax.Array, radius: float) -> SphereDict:
         "Xcart": jnp.array([]), # Npts x 3
         "Xncart": jnp.array([]),
         "Xsph": jnp.array([]), # Npts x 2, theta and phi grids.
-        # "Wts": jnp.array([]), # Npts x 1, naive quadrature weights, for testing
         "Sigma": jnp.array([])
     }
 
 def quadr_sphere(S: SphereDict, lmax: int) -> Tuple[SphereDict, shtns.sht]:
-    """Add a regular spherical grid for the sphere surface."""
+    """
+    Add a regular spherical grid for the sphere surface.
+    """
+
     S["lmax"] = lmax
     
     sh = shtns.sht(int(lmax))
     ntheta, nphi = sh.set_grid(flags=shtns.SHT_THETA_CONTIGUOUS)
-    # ntheta, nphi = sh.set_grid(nlat = lmax+1, nphi = 2*lmax+1, flags=shtns.SHT_THETA_CONTIGUOUS)
-    # jax.debug.print("ntheta = {a}, nphi = {b}, size of sh.cos_theta = {c}", a=ntheta, b=nphi, c=sh.cos_theta.shape)
     thetas = jnp.arccos(sh.cos_theta)
     phis = jnp.linspace(0, 2 * jnp.pi, nphi, endpoint=False)
     phi_grid, theta_grid = jnp.meshgrid(phis, thetas, indexing="ij")
@@ -51,12 +58,14 @@ def quadr_sphere(S: SphereDict, lmax: int) -> Tuple[SphereDict, shtns.sht]:
     S["Xncart"] = jnp.dstack([xn,yn,zn])
 
     S["Xsph"] = jnp.dstack([theta_grid, phi_grid])
-    # S["Wts"] = sh._grid_weights()
 
     return S, sh
 
 def set_density(S: SphereDict, sig_x: jax.Array, sig_y: jax.Array = jnp.array([]), sig_z: jax.Array = jnp.array([])) -> SphereDict:
-    """Add surface density to Sphere object"""
+    """
+    Add surface density to Sphere object
+    """
+
     assert sig_x.shape[0] > 0 
     assert S["Xcart"].shape[0] > 0
     assert S["Xcart"].shape[0] == sig_x.shape[0] and S["Xcart"].shape[1] == sig_x.shape[1]

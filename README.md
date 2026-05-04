@@ -1,1 +1,2 @@
 # sphere_stok3dbie
+A fast solver of Laplace and Stokes equations on a sphere using Boundary Integral Equations (BIE) and the layer potential operators spectra. Fast transforms to and from the scalar and vector spherical harmonics uses the [SHTns library](https://nschaeff.bitbucket.io/shtns/) in [python](https://github.com/meliao/shtns/tree/adjoint) with [jax](https://github.com/meliao/shtns/tree/jax_dev) support. 

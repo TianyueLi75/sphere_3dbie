@@ -1,17 +1,22 @@
+"""
+Numpy version of the Sphere Class: 
+    for vectorized and non-jaxed SHTns code
+"""
+
 from typing import Dict, Any, Tuple
 
 import os
 import sys
 import numpy as np
-
 import shtns
 
 SphereDict = Dict[str, Any]
 
 def build_sphere(center: np.ndarray, radius: float) -> SphereDict:
-    """ create a sphere dictionary with given center and radius. 
-    TODO: vectorized multi-sphere allow: ndarray of center and array of radii
+    """ 
+    create a sphere dictionary with given center and radius. 
     """
+
     return {
         "Xc": center,
         "r": radius,
@@ -19,12 +24,14 @@ def build_sphere(center: np.ndarray, radius: float) -> SphereDict:
         "Xcart": np.array([]), # Npts x 3
         "Xncart": np.array([]),
         "Xsph": np.array([]), # Npts x 2, theta and phi grids.
-        # "Wts": np.array([]), # Npts x 1, naive quadrature weights, for testing
         "Sigma": np.array([])
     }
 
 def quadr_sphere(S: SphereDict, lmax: int) -> Tuple[SphereDict, shtns.sht]:
-    """Add a regular spherical grid for the sphere surface."""
+    """
+    Add a regular spherical grid for the sphere surface.
+    """
+
     S["lmax"] = lmax
     
     sh = shtns.sht(int(lmax))
@@ -47,12 +54,14 @@ def quadr_sphere(S: SphereDict, lmax: int) -> Tuple[SphereDict, shtns.sht]:
     S["Xncart"] = np.dstack([xn,yn,zn])
 
     S["Xsph"] = np.dstack([theta_grid, phi_grid])
-    # S["Wts"] = sh._grid_weights()
 
     return S, sh
 
 def set_density(S: SphereDict, sig_x: np.ndarray, sig_y: np.ndarray = np.array([]), sig_z: np.ndarray = np.array([])) -> SphereDict:
-    """Add surface density to Sphere object"""
+    """
+    Add surface density to Sphere object
+    """
+    
     assert sig_x.shape[0] > 0 
     assert S["Xcart"].shape[0] > 0
     assert S["Xcart"].shape[0] == sig_x.shape[0] and S["Xcart"].shape[1] == sig_x.shape[1]
