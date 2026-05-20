@@ -9,6 +9,7 @@ import os
 import sys
 import numpy as np
 import shtns
+import shtns_jax
 
 SphereDict = Dict[str, Any]
 
@@ -27,15 +28,15 @@ def build_sphere(center: np.ndarray, radius: float) -> SphereDict:
         "Sigma": np.array([])
     }
 
-def quadr_sphere(S: SphereDict, lmax: int) -> Tuple[SphereDict, shtns.sht]:
+def quadr_sphere(S: SphereDict, lmax: int) -> Tuple[SphereDict, shtns_jax.sht]:
     """
     Add a regular spherical grid for the sphere surface.
     """
 
     S["lmax"] = lmax
     
-    sh = shtns.sht(int(lmax))
-    ntheta, nphi = sh.set_grid(flags=shtns.SHT_THETA_CONTIGUOUS)
+    sh = shtns_jax.sht(int(lmax))
+    ntheta, nphi = sh.set_grid(flags=shtns.SHT_THETA_CONTIGUOUS) # TODO: allow GPU
     thetas = np.arccos(sh.cos_theta)
     phis = np.linspace(0, 2 * np.pi, nphi, endpoint=False)
     phi_grid, theta_grid = np.meshgrid(phis, thetas, indexing="ij")

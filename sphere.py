@@ -12,6 +12,7 @@ import os
 import sys
 
 import shtns
+import shtns_jax
 jax.config.update("jax_enable_x64", True)  # support float64
 
 SphereDict = Dict[str, Any]
@@ -31,15 +32,15 @@ def build_sphere(center: jax.Array, radius: float) -> SphereDict:
         "Sigma": jnp.array([])
     }
 
-def quadr_sphere(S: SphereDict, lmax: int) -> Tuple[SphereDict, shtns.sht]:
+def quadr_sphere(S: SphereDict, lmax: int) -> Tuple[SphereDict, shtns_jax.sht]:
     """
     Add a regular spherical grid for the sphere surface.
     """
 
     S["lmax"] = lmax
     
-    sh = shtns.sht(int(lmax))
-    ntheta, nphi = sh.set_grid(flags=shtns.SHT_THETA_CONTIGUOUS)
+    sh = shtns_jax.sht(int(lmax))
+    ntheta, nphi = sh.set_grid(flags=shtns.SHT_THETA_CONTIGUOUS) # TODO: allow GPU
     thetas = jnp.arccos(sh.cos_theta)
     phis = jnp.linspace(0, 2 * jnp.pi, nphi, endpoint=False)
     phi_grid, theta_grid = jnp.meshgrid(phis, thetas, indexing="ij")

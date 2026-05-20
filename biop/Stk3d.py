@@ -14,92 +14,118 @@ from functools import partial
 
 import scipy
 import numpy as np
+import jax
+import jax.numpy as jnp
 import scipy.sparse.linalg
 import shtns
+import shtns_jax
 
 import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from sphere_np import *
+# from sphere_np import *
+from sphere import *
 
 SphereDict = Dict[str, Any]
 
-def cart2sph(Vx: np.ndarray, Vy: np.ndarray, Vz: np.ndarray, theta: np.ndarray, phi: np.ndarray) -> tuple([np.ndarray, np.ndarray, np.ndarray]):
+def cart2sph(Vx: jax.Array, Vy: jax.Array, Vz: jax.Array, theta: jax.Array, phi: jax.Array) -> tuple([jax.Array, jax.Array, jax.Array]):
     """
     Transform vector fields from Cartesian to spherical coordinates
     """
 
-    Vr = Vx * np.sin(theta) * np.cos(phi) + Vy * np.sin(theta) * np.sin(phi) + Vz * np.cos(theta)
-    Vtheta = Vx * np.cos(theta) * np.cos(phi) + Vy * np.cos(theta) * np.sin(phi) - Vz * np.sin(theta)
-    Vphi = -Vx * np.sin(phi) + Vy * np.cos(phi)
+    Vr = Vx * jnp.sin(theta) * jnp.cos(phi) + Vy * jnp.sin(theta) * jnp.sin(phi) + Vz * jnp.cos(theta)
+    Vtheta = Vx * jnp.cos(theta) * jnp.cos(phi) + Vy * jnp.cos(theta) * jnp.sin(phi) - Vz * jnp.sin(theta)
+    Vphi = -Vx * jnp.sin(phi) + Vy * jnp.cos(phi)
     return Vr, Vtheta, Vphi
 
-def sph2cart(Vr: np.ndarray, Vtheta: np.ndarray, Vphi: np.ndarray, theta: np.ndarray, phi: np.ndarray) -> tuple([np.ndarray, np.ndarray, np.ndarray]):
+def sph2cart(Vr: jax.Array, Vtheta: jax.Array, Vphi: jax.Array, theta: jax.Array, phi: jax.Array) -> tuple([jax.Array, jax.Array, jax.Array]):
     """
     Transform vector fields from spherical to Cartesian coordinates
     """
 
-    Vx = Vr * np.sin(theta) * np.cos(phi) + Vtheta * np.cos(theta) * np.cos(phi) - Vphi * np.sin(phi)
-    Vy = Vr * np.sin(theta) * np.sin(phi) + Vtheta * np.cos(theta) * np.sin(phi) + Vphi * np.cos(phi)
-    Vz = Vr * np.cos(theta) - Vtheta * np.sin(theta)
+    Vx = Vr * jnp.sin(theta) * jnp.cos(phi) + Vtheta * jnp.cos(theta) * jnp.cos(phi) - Vphi * jnp.sin(phi)
+    Vy = Vr * jnp.sin(theta) * jnp.sin(phi) + Vtheta * jnp.cos(theta) * jnp.sin(phi) + Vphi * jnp.cos(phi)
+    Vz = Vr * jnp.cos(theta) - Vtheta * jnp.sin(theta)
     return Vx, Vy, Vz
 
-def qst2vwx(qlm: np.ndarray, slm: np.ndarray, tlm: np.ndarray, sh: shtns.sht) -> tuple([np.ndarray, np.ndarray, np.ndarray]):
+def qst2vwx(qlm: jax.Array, slm: jax.Array, tlm: jax.Array, sh: shtns_jax.sht) -> tuple([jax.Array, jax.Array, jax.Array]):
     """
     Transform coefficients in Q,S,T basis (used in SHTns)
         to the V,W,X basis (diagonalizing basis for Stokes LP operators)
     """
     
-    l_vals = np.asarray(sh.zl, dtype=np.float64)
+    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
     vlm = (l_vals * slm - qlm) / (2.0*l_vals + 1.0)
     wlm = ((l_vals + 1.0) * slm + qlm) / (2.0*l_vals + 1.0)
     xlm = -tlm
     return vlm, wlm, xlm
 
-def vwx2qst(vlm: np.ndarray, wlm: np.ndarray, xlm: np.ndarray, sh: shtns.sht) -> tuple([np.ndarray, np.ndarray, np.ndarray]):
+def vwx2qst(vlm: jax.Array, wlm: jax.Array, xlm: jax.Array, sh: shtns_jax.sht) -> tuple([jax.Array, jax.Array, jax.Array]):
     """
     Transform coefficients in V,W,X basis (diagonalizing basis for Stokes LP operators)
         to the Q,S,T basis (used in SHTns)
     """
     
-    l_vals = np.asarray(sh.zl, dtype=np.float64)
+    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
     slm = vlm + wlm
     qlm = l_vals * (wlm - vlm) - vlm
     tlm = -xlm
     return qlm, slm, tlm
 
-def sig_xyz2vwx(sigma_x: np.ndarray, sigma_y: np.ndarray, sigma_z: np.ndarray, theta: np.ndarray, phi: np.ndarray, sh: shtns.sht) -> tuple([np.ndarray,np.ndarray,np.ndarray]):
+# TODO: to clean up, can work with only the (3, _, _) arrays
+def vec_stack(v1, v2, v3):
+    """
+    Takes the x, y, z or q, s, t vectors 
+        and stack them in (3, _, _) shape
+    """
+    return jnp.stack([v1, v2, v3], axis=0)
+
+def vec_distr(v_all):
+    """
+    Takes the output size (3, _, _) from synth or analys
+        and distribute into arrays v1, v2, v3
+    """
+    v1 = v_all[0,...]
+    v2 = v_all[1,...]
+    v3 = v_all[2,...]
+    return v1, v2, v3
+
+def sig_xyz2vwx(sigma_x: jax.Array, sigma_y: jax.Array, sigma_z: jax.Array, theta: jax.Array, phi: jax.Array, sh: shtns_jax.sht) -> tuple([jax.Array,jax.Array,jax.Array]):
     """
     Transforms vector fields in Cartesian coordinates  
         into its coefficients in V,W,X basis
     """
 
     sigma_r, sigma_t, sigma_p = cart2sph(sigma_x,sigma_y,sigma_z,theta,phi)
-    qlm, slm, tlm = sh.analys_cplx(sigma_r, sigma_t, sigma_p)
+    sigma_rtp = vec_stack(sigma_r, sigma_t, sigma_p)
+    qstlm = sh.analys_vec_cplx_jax(sigma_rtp)
+    qlm, slm, tlm = vec_distr(qstlm) 
     vlm, wlm, xlm = qst2vwx(qlm, slm, tlm, sh)
     return vlm, wlm, xlm
 
-def sig_vwx2xyz(vlm: np.ndarray, wlm: np.ndarray, xlm: np.ndarray, theta: np.ndarray, phi: np.ndarray, sh: shtns.sht) -> tuple([np.ndarray, np.ndarray, np.ndarray]):
+def sig_vwx2xyz(vlm: jax.Array, wlm: jax.Array, xlm: jax.Array, theta: jax.Array, phi: jax.Array, sh: shtns_jax.sht) -> tuple([jax.Array, jax.Array, jax.Array]):
     """
     Transforms coefficients in V,W,X basis
         into its Cartesian coordinates
     """
 
     qlm, slm, tlm = vwx2qst(vlm,wlm,xlm,sh)
-    vr, vt, vp = sh.synth_cplx(qlm, slm, tlm)
+    qstlm = vec_stack(qlm, slm, tlm)
+    vrtp = sh.synth_vec_cplx_jax(qstlm)
+    vr, vt, vp = vec_distr(vrtp)
     vx, vy, vz = sph2cart(vr, vt, vp, theta, phi)
     return vx, vy, vz
 
-def Stk3d_sl_VWX_diag(sh: shtns.sht) -> tuple([np.ndarray, np.ndarray, np.ndarray]):
-    l_vals = np.asarray(sh.zl, dtype=np.float64)
+def Stk3d_sl_VWX_diag(sh: shtns_jax.sht) -> tuple([jax.Array, jax.Array, jax.Array]):
+    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
     diag_V = l_vals / (2.0*l_vals + 1.0) / (2.0*l_vals + 3.0)
     diag_W = (l_vals + 1.0) / (2.0*l_vals + 1.0) / (2.0*l_vals - 1.0)
     diag_X = 1.0 / (2.0*l_vals + 1.0)
     return diag_V, diag_W, diag_X
 
-def Stk3d_dl_VWX_diag(sh: shtns.sht) -> tuple([np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]):
-    l_vals = np.asarray(sh.zl, dtype=np.float64)
+def Stk3d_dl_VWX_diag(sh: shtns_jax.sht) -> tuple([jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]):
+    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
 
     diag_V_ext = (2.0*l_vals*l_vals + 4*l_vals + 3) / (2.0*l_vals + 1.0) / (2.0*l_vals + 3.0)
     diag_W_ext = 2.0*(l_vals + 1.0)*(l_vals - 1.0) / (2.0*l_vals + 1.0) / (2.0*l_vals - 1.0)
@@ -111,7 +137,7 @@ def Stk3d_dl_VWX_diag(sh: shtns.sht) -> tuple([np.ndarray, np.ndarray, np.ndarra
 
     return diag_V_ext, diag_W_ext, diag_X_ext, diag_V_int, diag_W_int, diag_X_int
 
-def Stk3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns.sht) -> np.ndarray:
+def Stk3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
     Off-surface evaluation at a spherical grid of targets
         From source <S> with density <S["Sigma"]>, source uses SHT object <sh>
@@ -120,10 +146,10 @@ def Stk3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns
 
     if S["lmax"] != sh.lmax:
         print("S lmax does not match sht's lmax, reform sht.")
-        sh = shtns.sht(S["lmax"], S["lmax"])
+        sh = shtns_jax.sht(S["lmax"], S["lmax"])
     if Strg["lmax"] != shtrg.lmax:
         print("Strg lmax does not match sht_trg's lmax, reform sht_trg.")
-        shtrg = shtns.sht(Strg["lmax"], Strg["lmax"])
+        shtrg = shtns_jax.sht(Strg["lmax"], Strg["lmax"])
 
     Sigma_x = S["Sigma"][:,:,0] 
     Sigma_y = S["Sigma"][:,:,1] 
@@ -133,7 +159,7 @@ def Stk3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns
     vlm_sigma, wlm_sigma, xlm_sigma = sig_xyz2vwx(Sigma_x, Sigma_y, Sigma_z, theta, phi, sh)
     
     trg_dr = Strg["r"]
-    l_vals = np.asarray(sh.zl, dtype=np.float64) 
+    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64) 
     diag_V, diag_W, diag_X = Stk3d_sl_VWX_diag(sh) 
     rpowers_V_ext = trg_dr ** (-l_vals-2.0) 
     rpowers_V_int = trg_dr ** (l_vals+1.0) 
@@ -167,19 +193,19 @@ def Stk3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns
     nlm_src = sh.nlm_cplx
     nlm_trg = shtrg.nlm_cplx
     if nlm_trg > nlm_src:
-        vlm_SL_sigma = np.pad(vlm_SL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
-        wlm_SL_sigma = np.pad(wlm_SL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
-        xlm_SL_sigma = np.pad(xlm_SL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+        vlm_SL_sigma = jnp.pad(vlm_SL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+        wlm_SL_sigma = jnp.pad(wlm_SL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+        xlm_SL_sigma = jnp.pad(xlm_SL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
     elif nlm_trg < nlm_src:
         vlm_SL_sigma = vlm_SL_sigma[:nlm_trg]
         wlm_SL_sigma = wlm_SL_sigma[:nlm_trg]
         xlm_SL_sigma = xlm_SL_sigma[:nlm_trg]
     val_x, val_y, val_z = sig_vwx2xyz(vlm_SL_sigma, wlm_SL_sigma, xlm_SL_sigma, theta_trg, phi_trg, shtrg)
-    SL_sigma = np.stack([val_x, val_y, val_z], axis=2)
+    SL_sigma = jnp.stack([val_x, val_y, val_z], axis=2)
 
     return SL_sigma
 
-def Stk3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns.sht) -> np.ndarray:
+def Stk3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
     Off-surface evaluation at a spherical grid of targets
         From source <S> with density <S["Sigma"]>, source uses SHT object <sh>
@@ -188,10 +214,10 @@ def Stk3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns
 
     if S["lmax"] != sh.lmax:
         print("S lmax does not match sht's lmax, reform sht.")
-        sh = shtns.sht(S["lmax"], S["lmax"])
+        sh = shtns_jax.sht(S["lmax"], S["lmax"])
     if Strg["lmax"] != shtrg.lmax:
         print("Strg lmax does not match sht_trg's lmax, reform sht_trg.")
-        shtrg = shtns.sht(Strg["lmax"], Strg["lmax"])
+        shtrg = shtns_jax.sht(Strg["lmax"], Strg["lmax"])
 
     Sigma_x = S["Sigma"][:,:,0] 
     Sigma_y = S["Sigma"][:,:,1] 
@@ -201,7 +227,7 @@ def Stk3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns
     vlm_sigma, wlm_sigma, xlm_sigma = sig_xyz2vwx(Sigma_x, Sigma_y, Sigma_z, theta, phi, sh)
 
     trg_dr = Strg["r"]
-    l_vals = np.asarray(sh.zl, dtype=np.float64) 
+    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64) 
     diag_V_ext, diag_W_ext, diag_X_ext, diag_V_int, diag_W_int, diag_X_int = Stk3d_dl_VWX_diag(sh)
     
     rpowers_V_ext = trg_dr ** (- l_vals - 2.0) 
@@ -236,19 +262,19 @@ def Stk3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns
     nlm_src = sh.nlm_cplx
     nlm_trg = shtrg.nlm_cplx
     if nlm_trg > nlm_src:
-        vlm_DL_sigma = np.pad(vlm_DL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
-        wlm_DL_sigma = np.pad(wlm_DL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
-        xlm_DL_sigma = np.pad(xlm_DL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+        vlm_DL_sigma = jnp.pad(vlm_DL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+        wlm_DL_sigma = jnp.pad(wlm_DL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+        xlm_DL_sigma = jnp.pad(xlm_DL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
     elif nlm_trg < nlm_src:
         vlm_DL_sigma = vlm_DL_sigma[:nlm_trg]
         wlm_DL_sigma = wlm_DL_sigma[:nlm_trg]
         xlm_DL_sigma = xlm_DL_sigma[:nlm_trg]
     val_x, val_y, val_z = sig_vwx2xyz(vlm_DL_sigma, wlm_DL_sigma, xlm_DL_sigma, theta_trg, phi_trg, shtrg)
-    DL_sigma = np.stack([val_x, val_y, val_z], axis=2)
+    DL_sigma = jnp.stack([val_x, val_y, val_z], axis=2)
 
     return DL_sigma
 
-def bio_onsurf_apply(sigma_tens: np.ndarray, theta: np.ndarray, phi: np.ndarray, sh: shtns.sht, sl_scal: float, dl_scal: float, sgn: float) -> np.ndarray:
+def bio_onsurf_apply(sigma_tens: jax.Array, theta: jax.Array, phi: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float) -> jax.Array:
     """
     Apply the combined DL potential operator K = sl_scal * SL + dl_scal * DL
         to the density <sigma_tens> (flattened) defined on the <sh> grid
@@ -280,11 +306,11 @@ def bio_onsurf_apply(sigma_tens: np.ndarray, theta: np.ndarray, phi: np.ndarray,
     vx = vx + 0.5 * sgn * dl_scal * sigma_x
     vy = vy + 0.5 * sgn * dl_scal * sigma_y
     vz = vz + 0.5 * sgn * dl_scal * sigma_z
-    V = np.stack([vx, vy, vz], axis=2)
+    V = jnp.stack([vx, vy, vz], axis=2)
 
     return V.flatten()
 
-def stokes_onsurf_direct_solve(bc_vec: np.ndarray, theta: np.ndarray, phi: np.ndarray, sh: shtns.sht, sl_scal: float, dl_scal: float, sgn: float) -> np.ndarray:
+def stokes_onsurf_direct_solve(bc_vec: jax.Array, theta: jax.Array, phi: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float) -> jax.Array:
     """
     Directly solves the Stokes BIO equation using the VWX diagonal property.
     """
@@ -302,10 +328,10 @@ def stokes_onsurf_direct_solve(bc_vec: np.ndarray, theta: np.ndarray, phi: np.nd
 
     eps = 1e-14
     def safe_div(bc_lm, op_diag):
-        safe = np.where(np.abs(op_diag) > eps, op_diag, 1.0+0j)
+        safe = jnp.where(jnp.abs(op_diag) > eps, op_diag, 1.0+0j)
         res = bc_lm / safe
         # Return BC value where diag is zero (null space)
-        return np.where(np.abs(op_diag) <= eps, bc_lm, res)
+        return jnp.where(jnp.abs(op_diag) <= eps, bc_lm, res)
 
     vlm_sigma = safe_div(vlm_bc, op_diag_V)
     wlm_sigma = safe_div(wlm_bc, op_diag_W)
@@ -313,9 +339,9 @@ def stokes_onsurf_direct_solve(bc_vec: np.ndarray, theta: np.ndarray, phi: np.nd
 
     sig_x, sig_y, sig_z = sig_vwx2xyz(vlm_sigma, wlm_sigma, xlm_sigma, theta, phi, sh)
     
-    return np.stack([sig_x, sig_y, sig_z], axis=-1)
+    return jnp.stack([sig_x, sig_y, sig_z], axis=-1)
 
-def bio_offsurf_apply_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns.sht, sl_scal: float, dl_scal: float) -> np.ndarray:
+def bio_offsurf_apply_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: shtns_jax.sht, sl_scal: float, dl_scal: float) -> jax.Array:
     """
     Evaluate the KL formulation of <S> with density <S["Sigma"]> at a spherical grid of targets on <Strg>
     """
@@ -325,7 +351,7 @@ def bio_offsurf_apply_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh
     Ksigma = sl_scal * SLsigma + dl_scal * DLsigma
     return Ksigma
 
-def compute_field(trg: np.ndarray, src: np.ndarray, force: np.ndarray) -> np.ndarray:
+def compute_field(trg: jax.Array, src: jax.Array, force: jax.Array) -> jax.Array:
     """
     Compute the field generated by Stokeslets
         positioned at <src>: Nsrc x 3 
@@ -342,17 +368,17 @@ def compute_field(trg: np.ndarray, src: np.ndarray, force: np.ndarray) -> np.nda
     dx = trg[:,0][:,None] - srcx 
     dy = trg[:,1][:,None] - srcy
     dz = trg[:,2][:,None] - srcz
-    dr = np.sqrt(dx*dx + dy*dy + dz*dz)
+    dr = jnp.sqrt(dx*dx + dy*dy + dz*dz)
     
-    r_vec = np.stack([dx, dy, dz], axis=-1) 
+    r_vec = jnp.stack([dx, dy, dz], axis=-1) 
     r_norm = dr[..., None]  
     r_hat = r_vec / r_norm
     force_expanded = force[None, :, :]  
-    dot_prod = np.sum(force_expanded * r_vec, axis=-1, keepdims=True)  
-    u_contrib = (1/(8*np.pi)) * (force_expanded / r_norm + dot_prod * r_hat / (r_norm**2))
-    u = np.sum(u_contrib, axis=1)  
+    dot_prod = jnp.sum(force_expanded * r_vec, axis=-1, keepdims=True)  
+    u_contrib = (1/(8*jnp.pi)) * (force_expanded / r_norm + dot_prod * r_hat / (r_norm**2))
+    u = jnp.sum(u_contrib, axis=1)  
     
-    return u.astype(np.complex128)
+    return u.astype(jnp.complex128)
     
 if __name__ == "__main__":
     """
@@ -361,7 +387,7 @@ if __name__ == "__main__":
 
     # Geometry setup
     lmax = 36
-    center = np.array([0.,0.,0.])
+    center = jnp.array([0.,0.,0.])
     radius = 1.
     S = build_sphere(center, radius)
     S, sh = quadr_sphere(S, lmax)
@@ -376,17 +402,17 @@ if __name__ == "__main__":
     Strg, shtrg = quadr_sphere(Strg, lmax)
     
     # Manufactured solutions test
-    ptsrc = np.array([[0.1,0.3,0.15],[-0.35,0.2,0.]]) 
-    force = np.array([[1,1,1],[-1,0,0]])
+    ptsrc = jnp.array([[0.1,0.3,0.15],[-0.35,0.2,0.]]) 
+    force = jnp.array([[1,1,1],[-1,0,0]])
 
     x = S["Xcart"][:,:,0]
     y = S["Xcart"][:,:,1]
     z = S["Xcart"][:,:,2]
     theta = S["Xsph"][:,:,0]
     phi = S["Xsph"][:,:,1]
-    trg_sphere = np.column_stack([np.reshape(x,-1), np.reshape(y,-1), np.reshape(z,-1)])
+    trg_sphere = jnp.column_stack([jnp.reshape(x,-1), jnp.reshape(y,-1), jnp.reshape(z,-1)])
     BC_pot = compute_field(trg_sphere, ptsrc, force)
-    BC_pot = np.reshape(BC_pot, S["Xcart"].shape)
+    BC_pot = jnp.reshape(BC_pot, S["Xcart"].shape)
 
     # GMRES solve
     StkK_apply = partial(
@@ -398,43 +424,45 @@ if __name__ == "__main__":
         dl_scal=dl_scal, 
         sgn=sgn
     )
-    total_dofs = S["Xcart"].size
-    gmres_func = scipy.sparse.linalg.LinearOperator((total_dofs, total_dofs), \
-                                                    matvec=StkK_apply, \
-                                                    dtype=np.complex128)
-    x, info = scipy.sparse.linalg.gmres(gmres_func, BC_pot.flatten(), x0=np.zeros(total_dofs, dtype=np.complex128), \
-                                        atol = 1e-14, rtol = 1e-13, maxiter=200)
-    sig_gmres = x.reshape(theta.shape[0], theta.shape[1], 3)
-    bc_check = bio_onsurf_apply(x, theta, phi, sh, sl_scal, dl_scal, sgn)
-    resid_gmres = np.linalg.norm(bc_check - BC_pot.flatten())
-    print("Residual of GMRES solve = {a}, exitcode (0:successful): {b}".format(a=resid_gmres, b=info))
+    # TODO: fix the following gmres to be lx gmres, not np
+    # total_dofs = S["Xcart"].size
+    # gmres_func = scipy.sparse.linalg.LinearOperator((total_dofs, total_dofs), \
+    #                                                 matvec=StkK_apply, \
+    #                                                 dtype=jnp.complex128)
+    # x, info = scipy.sparse.linalg.gmres(gmres_func, BC_pot.flatten(), x0=jnp.zeros(total_dofs, dtype=jnp.complex128), \
+    #                                     atol = 1e-14, rtol = 1e-13, maxiter=200)
+    # sig_gmres = x.reshape(theta.shape[0], theta.shape[1], 3)
+    # bc_check = bio_onsurf_apply(x, theta, phi, sh, sl_scal, dl_scal, sgn)
+    # resid_gmres = jnp.linalg.norm(bc_check - BC_pot.flatten())
+    # print("Residual of GMRES solve = {a}, exitcode (0:successful): {b}".format(a=resid_gmres, b=info))
 
     # DIRECT solve
     sig_direct = stokes_onsurf_direct_solve(BC_pot, theta, phi, sh, sl_scal, dl_scal, sgn)
     bc_check_direct = bio_onsurf_apply(sig_direct.flatten(), theta, phi, sh, sl_scal, dl_scal, sgn)
-    resid_direct = np.linalg.norm(bc_check_direct - BC_pot.flatten())
+    resid_direct = jnp.linalg.norm(bc_check_direct - BC_pot.flatten())
     print("Residual of DIRECT solve = {a}".format(a=resid_direct))
 
     # Accuracy
     xtrg = Strg["Xcart"][:,:,0] 
     ytrg = Strg["Xcart"][:,:,1]
     ztrg = Strg["Xcart"][:,:,2]
-    trg_sphere2 = np.column_stack([np.reshape(xtrg,-1), np.reshape(ytrg,-1), np.reshape(ztrg,-1)])
+    trg_sphere2 = jnp.column_stack([jnp.reshape(xtrg,-1), jnp.reshape(ytrg,-1), jnp.reshape(ztrg,-1)])
     true_field = compute_field(trg_sphere2, ptsrc, force) 
-    true_field = np.reshape(true_field, Strg["Xcart"].shape)
-    true_field = np.real(true_field)
+    true_field = jnp.reshape(true_field, Strg["Xcart"].shape)
+    true_field = jnp.real(true_field)
 
-    S = set_density(S, sig_gmres[:,:,0], sig_gmres[:,:,1], sig_gmres[:,:,2])
-    Ksig_gmres = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
-    Ksig_gmres = np.real(Ksig_gmres)
+    # S = set_density(S, sig_gmres[:,:,0], sig_gmres[:,:,1], sig_gmres[:,:,2])
+    # Ksig_gmres = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
+    # Ksig_gmres = jnp.real(Ksig_gmres)
 
     S = set_density(S, sig_direct[:,:,0], sig_direct[:,:,1], sig_direct[:,:,2])
     Ksig_direct = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
-    Ksig_direct = np.real(Ksig_direct)
+    Ksig_direct = jnp.real(Ksig_direct)
 
-    diff_gmres = np.max(true_field - Ksig_gmres) / np.max(true_field)
-    diff_direct = np.max(true_field - Ksig_direct) / np.max(true_field)
-    print("Max relative error of order {lmax} solver at target radius {Rtrg} for GMRES solver is {d1}, for direct solver is {d2}".format(lmax=lmax, Rtrg=Rtrg, d1=diff_gmres, d2=diff_direct))
+    # diff_gmres = jnp.max(true_field - Ksig_gmres) / jnp.max(true_field)
+    diff_direct = jnp.max(true_field - Ksig_direct) / jnp.max(true_field)
+    # print("Max relative error of order {lmax} solver at target radius {Rtrg} for GMRES solver is {d1}, for direct solver is {d2}".format(lmax=lmax, Rtrg=Rtrg, d1=diff_gmres, d2=diff_direct))
+    print("Max relative error of order {lmax} solver at target radius {Rtrg} for direct solver is {d2}".format(lmax=lmax, Rtrg=Rtrg, d2=diff_direct))
 
 
     # Targets -- interior
@@ -443,17 +471,17 @@ if __name__ == "__main__":
     Strg = build_sphere(center, Rtrg)
     Strg, shtrg = quadr_sphere(Strg, lmax)
 
-    ptsrc = np.array([[1.3,1.75,-2],[-1.3,-1.75,2]])
-    force = np.array([[1,1,1],[-1,-1,-1]]) # net force zero for interior flow
+    ptsrc = jnp.array([[1.3,1.75,-2],[-1.3,-1.75,2]])
+    force = jnp.array([[1,1,1],[-1,-1,-1]]) # net force zero for interior flow
 
     x = S["Xcart"][:,:,0]
     y = S["Xcart"][:,:,1]
     z = S["Xcart"][:,:,2]
     theta = S["Xsph"][:,:,0]
     phi = S["Xsph"][:,:,1]
-    trg_sphere = np.column_stack([np.reshape(x,-1), np.reshape(y,-1), np.reshape(z,-1)])
+    trg_sphere = jnp.column_stack([jnp.reshape(x,-1), jnp.reshape(y,-1), jnp.reshape(z,-1)])
     BC_pot = compute_field(trg_sphere, ptsrc, force)
-    BC_pot = np.reshape(BC_pot, S["Xcart"].shape)
+    BC_pot = jnp.reshape(BC_pot, S["Xcart"].shape)
 
     # GMRES solve
     StkK_apply = partial(
@@ -465,40 +493,41 @@ if __name__ == "__main__":
         dl_scal=dl_scal, 
         sgn=sgn
     )
-    total_dofs = S["Xcart"].size
-    gmres_func = scipy.sparse.linalg.LinearOperator((total_dofs, total_dofs), \
-                                                    matvec=StkK_apply, \
-                                                    dtype=np.complex128)
-    x, info = scipy.sparse.linalg.gmres(gmres_func, BC_pot.flatten(), x0=np.zeros(total_dofs, dtype=np.complex128), \
-                                        atol = 1e-14, rtol = 1e-13, maxiter=200)
-    sig_gmres = x.reshape(theta.shape[0], theta.shape[1], 3)
-    bc_check = bio_onsurf_apply(x, theta, phi, sh, sl_scal, dl_scal, sgn)
-    resid_gmres = np.linalg.norm(bc_check - BC_pot.flatten())
-    print("Residual of GMRES solve = {a}, exitcode (0:successful): {b}".format(a=resid_gmres, b=info))
+    # total_dofs = S["Xcart"].size
+    # gmres_func = scipy.sparse.linalg.LinearOperator((total_dofs, total_dofs), \
+    #                                                 matvec=StkK_apply, \
+    #                                                 dtype=jnp.complex128)
+    # x, info = scipy.sparse.linalg.gmres(gmres_func, BC_pot.flatten(), x0=jnp.zeros(total_dofs, dtype=jnp.complex128), \
+    #                                     atol = 1e-14, rtol = 1e-13, maxiter=200)
+    # sig_gmres = x.reshape(theta.shape[0], theta.shape[1], 3)
+    # bc_check = bio_onsurf_apply(x, theta, phi, sh, sl_scal, dl_scal, sgn)
+    # resid_gmres = jnp.linalg.norm(bc_check - BC_pot.flatten())
+    # print("Residual of GMRES solve = {a}, exitcode (0:successful): {b}".format(a=resid_gmres, b=info))
 
     # DIRECT solve
     sig_direct = stokes_onsurf_direct_solve(BC_pot, theta, phi, sh, sl_scal, dl_scal, sgn)
     bc_check_direct = bio_onsurf_apply(sig_direct.flatten(), theta, phi, sh, sl_scal, dl_scal, sgn)
-    resid_diag = np.linalg.norm(bc_check_direct - BC_pot.flatten())
+    resid_diag = jnp.linalg.norm(bc_check_direct - BC_pot.flatten())
     print("Residual of DIRECT solve = {a}".format(a=resid_diag))
 
     # Accuracy
     xtrg = Strg["Xcart"][:,:,0] 
     ytrg = Strg["Xcart"][:,:,1]
     ztrg = Strg["Xcart"][:,:,2]
-    trg_sphere2 = np.column_stack([np.reshape(xtrg,-1), np.reshape(ytrg,-1), np.reshape(ztrg,-1)])
+    trg_sphere2 = jnp.column_stack([jnp.reshape(xtrg,-1), jnp.reshape(ytrg,-1), jnp.reshape(ztrg,-1)])
     true_field = compute_field(trg_sphere2, ptsrc, force) 
-    true_field = np.reshape(true_field, S["Xcart"].shape)
-    true_field = np.real(true_field)
+    true_field = jnp.reshape(true_field, S["Xcart"].shape)
+    true_field = jnp.real(true_field)
 
-    S = set_density(S, sig_gmres[:,:,0], sig_gmres[:,:,1], sig_gmres[:,:,2])
-    Ksig_gmres = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
-    Ksig_gmres = np.real(Ksig_gmres)
+    # S = set_density(S, sig_gmres[:,:,0], sig_gmres[:,:,1], sig_gmres[:,:,2])
+    # Ksig_gmres = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
+    # Ksig_gmres = jnp.real(Ksig_gmres)
 
     S = set_density(S, sig_direct[:,:,0], sig_direct[:,:,1], sig_direct[:,:,2])
     Ksig_direct = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
-    Ksig_direct = np.real(Ksig_direct)
+    Ksig_direct = jnp.real(Ksig_direct)
 
-    diff_gmres = np.max(true_field - Ksig_gmres) / np.max(true_field)
-    diff_direct = np.max(true_field - Ksig_direct) / np.max(true_field)
-    print("Max relative error of order {lmax} solver at target radius {Rtrg} for GMRES solver is {d1}, for direct solver is {d2}".format(lmax=lmax, Rtrg=Rtrg, d1=diff_gmres, d2=diff_direct))
+    # diff_gmres = jnp.max(true_field - Ksig_gmres) / jnp.max(true_field)
+    diff_direct = jnp.max(true_field - Ksig_direct) / jnp.max(true_field)
+    # print("Max relative error of order {lmax} solver at target radius {Rtrg} for GMRES solver is {d1}, for direct solver is {d2}".format(lmax=lmax, Rtrg=Rtrg, d1=diff_gmres, d2=diff_direct))
+    print("Max relative error of order {lmax} solver at target radius {Rtrg} for direct solver is {d2}".format(lmax=lmax, Rtrg=Rtrg,  d2=diff_direct))
