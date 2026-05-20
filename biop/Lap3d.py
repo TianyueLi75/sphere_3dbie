@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import lineax as lx
 import shtns
+import shtns_jax
 
 import os
 import sys
@@ -27,18 +28,18 @@ jax.config.update("jax_enable_x64", True)  # support float64
 
 SphereDict = Dict[str, Any]
 
-def Lap3d_sl_diag(sh: shtns.sht) -> jax.Array:
+def Lap3d_sl_diag(sh: shtns_jax.sht) -> jax.Array:
     l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
     diag = 1.0 / (2.0 * l_vals + 1.0)
     return diag
 
-def Lap3d_dl_diag(sh: shtns.sht) -> tuple([jax.Array, jax.Array]):
+def Lap3d_dl_diag(sh: shtns_jax.sht) -> tuple([jax.Array, jax.Array]):
     l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
     diag_ext = l_vals / (2.0 * l_vals + 1.0) 
     diag_int = - (l_vals + 1) / (2.0 * l_vals + 1.0)
     return diag_ext, diag_int
 
-def Lap3d_sl(trg: jax.Array, S: SphereDict, sh: shtns.sht) -> jax.Array:
+def Lap3d_sl(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
     Off-surface evaluation at points <trg>: Ntrg x 3
         From source <S> with density <S["Sigma"]>
@@ -49,7 +50,7 @@ def Lap3d_sl(trg: jax.Array, S: SphereDict, sh: shtns.sht) -> jax.Array:
 
     if S["lmax"] != sh.lmax:
         print("S lmax does not match sht's lmax, reform sht.")
-        sh = shtns.sht(S["lmax"], S["lmax"])
+        sh = shtns_jax.sht(S["lmax"], S["lmax"])
 
     Sigma = S["Sigma"][:,:,0] 
     qlm_sigma = sh.analys_cplx_jax(Sigma)
@@ -83,7 +84,7 @@ def Lap3d_sl(trg: jax.Array, S: SphereDict, sh: shtns.sht) -> jax.Array:
 
     return SL_sigma
 
-def Lap3d_dl(trg: jax.Array, S: SphereDict, sh: shtns.sht) -> jax.Array:
+def Lap3d_dl(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
     Off-surface evaluation at points <trg>: Ntrg x 3
         From source <S> with density <S["Sigma"]>
@@ -94,7 +95,7 @@ def Lap3d_dl(trg: jax.Array, S: SphereDict, sh: shtns.sht) -> jax.Array:
 
     if S["lmax"] != sh.lmax:
         print("S lmax does not match sht's lmax, reform sht.")
-        sh = shtns.sht(S["lmax"])
+        sh = shtns_jax.sht(S["lmax"])
 
     Sigma = S["Sigma"][:,:,0] # scalar operator, so only take Sigma_x
     qlm_sigma = sh.analys_cplx_jax(Sigma)
@@ -127,7 +128,7 @@ def Lap3d_dl(trg: jax.Array, S: SphereDict, sh: shtns.sht) -> jax.Array:
 
     return DL_sigma
 
-def Lap3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns.sht) -> jax.Array:
+def Lap3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
     Off-surface evaluation at a spherical grid of targets
         From source <S> with density <S["Sigma"]>, source uses SHT object <sh>
@@ -136,10 +137,10 @@ def Lap3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns
 
     if S["lmax"] != sh.lmax:
         print("S lmax does not match sht's lmax, reform sht.")
-        sh = shtns.sht(S["lmax"], S["lmax"])
+        sh = shtns_jax.sht(S["lmax"], S["lmax"])
     if Strg["lmax"] != shtrg.lmax:
         print("Strg lmax does not match sht_trg's lmax, reform sht_trg.")
-        shtrg = shtns.sht(Strg["lmax"], Strg["lmax"])
+        shtrg = shtns_jax.sht(Strg["lmax"], Strg["lmax"])
 
     Sigma = S["Sigma"][:,:,0] 
     qlm_sigma = sh.analys_cplx_jax(Sigma)
@@ -167,7 +168,7 @@ def Lap3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns
 
     return SL_sigma
 
-def Lap3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns.sht) -> jax.Array:
+def Lap3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
     Off-surface evaluation at a spherical grid of targets
         From source <S> with density <S["Sigma"]>, source uses SHT object <sh>
@@ -176,10 +177,10 @@ def Lap3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns
 
     if S["lmax"] != sh.lmax:
         print("S lmax does not match sht's lmax, reform sht.")
-        sh = shtns.sht(S["lmax"], S["lmax"])
+        sh = shtns_jax.sht(S["lmax"], S["lmax"])
     if Strg["lmax"] != shtrg.lmax:
         print("Strg lmax does not match sht_trg's lmax, reform sht_trg.")
-        shtrg = shtns.sht(Strg["lmax"], Strg["lmax"])
+        shtrg = shtns_jax.sht(Strg["lmax"], Strg["lmax"])
 
     Sigma = S["Sigma"][:,:,0] 
     qlm_sigma = sh.analys_cplx_jax(Sigma)
@@ -235,7 +236,7 @@ def compute_potential(trg: jax.Array, src: jax.Array, force: jax.Array) -> jax.A
     return G
 
 @partial(jax.jit, static_argnames=["sh"])
-def bio_diag_apply(qlm_sigma: jax.Array, sh: shtns.sht, sl_scal: float, dl_scal: float) -> jax.Array:
+def bio_diag_apply(qlm_sigma: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float) -> jax.Array:
     """
     Apply the combined DL potential operator K = sl_scal * SL + dl_scal * DL
         to the density with coefficients <qlm_sigma> in SH basis 
@@ -252,7 +253,7 @@ def bio_diag_apply(qlm_sigma: jax.Array, sh: shtns.sht, sl_scal: float, dl_scal:
     return qlm_KL_sigma
 
 @partial(jax.jit, static_argnames=["sh"])
-def bio_onsurf_apply(sigma: jax.Array, sh: shtns.sht, sl_scal: float, dl_scal: float, sgn: float) -> jax.Array:
+def bio_onsurf_apply(sigma: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float) -> jax.Array:
     """
     Apply the combined DL potential operator K = sl_scal * SL + dl_scal * DL
         to the density <sigma> defined on the <sh> grid
@@ -265,7 +266,7 @@ def bio_onsurf_apply(sigma: jax.Array, sh: shtns.sht, sl_scal: float, dl_scal: f
     return 0.5 * dl_scal * sgn * sigma + KL_sigma
 
 @partial(jax.jit, static_argnames=["sh"])
-def bio_onsurf_direct_solve(bc_pot: jax.Array, sh: shtns.sht, sl_scal: float, dl_scal: float, sgn: float) -> jax.Array:
+def bio_onsurf_direct_solve(bc_pot: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float) -> jax.Array:
     """
     Directly solves the BIO equation in the spectral domain.
     Equation: [0.5 * dl_scal * sgn * I + KL] sigma = bc_pot
@@ -290,7 +291,7 @@ def bio_onsurf_direct_solve(bc_pot: jax.Array, sh: shtns.sht, sl_scal: float, dl
     
     return sigma
 
-def bio_offsurf_apply(trg: jax.Array, S: SphereDict, sh: shtns.sht, sl_scal: float, dl_scal: float) -> jax.Array:
+def bio_offsurf_apply(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht, sl_scal: float, dl_scal: float) -> jax.Array:
     """
     Evaluate the KL formulation of <S> with density <S["Sigma"]> at target <trg>
     """
@@ -300,7 +301,7 @@ def bio_offsurf_apply(trg: jax.Array, S: SphereDict, sh: shtns.sht, sl_scal: flo
     Ksigma = sl_scal * SLsigma + dl_scal * DLsigma 
     return Ksigma
 
-def bio_offsurf_apply_1sph(Strg: SphereDict, shtrg: shtns.sht, S: SphereDict, sh: shtns.sht, sl_scal: float, dl_scal: float) -> jax.Array:
+def bio_offsurf_apply_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: shtns_jax.sht, sl_scal: float, dl_scal: float) -> jax.Array:
     """
     Evaluate the KL formulation of <S> with density <S["Sigma"]> at a spherical grid of targets on <Strg>
     """
