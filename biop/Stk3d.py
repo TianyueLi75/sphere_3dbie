@@ -16,7 +16,8 @@ import scipy
 import numpy as np
 import jax
 import jax.numpy as jnp
-import scipy.sparse.linalg
+# import scipy.sparse.linalg
+import lineax as lx
 import shtns
 import shtns_jax
 
@@ -277,12 +278,11 @@ def Stk3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: s
 def bio_onsurf_apply(sigma_tens: jax.Array, theta: jax.Array, phi: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float) -> jax.Array:
     """
     Apply the combined DL potential operator K = sl_scal * SL + dl_scal * DL
-        to the density <sigma_tens> (flattened) defined on the <sh> grid
+        to the density <sigma_tens> defined on the <sh> grid
         taking into account the DL jump condition with sign <sgn>.
-    Returns the resulting function, also defined on the <sh> grid, flattened.
+    Returns the resulting function, also defined on the <sh> grid.
     """
 
-    sigma_tens = sigma_tens.reshape(theta.shape[0], theta.shape[1], 3)
     sigma_x = sigma_tens[:,:,0]
     sigma_y = sigma_tens[:,:,1]
     sigma_z = sigma_tens[:,:,2]
@@ -308,7 +308,7 @@ def bio_onsurf_apply(sigma_tens: jax.Array, theta: jax.Array, phi: jax.Array, sh
     vz = vz + 0.5 * sgn * dl_scal * sigma_z
     V = jnp.stack([vx, vy, vz], axis=2)
 
-    return V.flatten()
+    return V
 
 def stokes_onsurf_direct_solve(bc_vec: jax.Array, theta: jax.Array, phi: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float) -> jax.Array:
     """
@@ -424,22 +424,27 @@ if __name__ == "__main__":
         dl_scal=dl_scal, 
         sgn=sgn
     )
-    # TODO: fix the following gmres to be lx gmres, not np
-    # total_dofs = S["Xcart"].size
-    # gmres_func = scipy.sparse.linalg.LinearOperator((total_dofs, total_dofs), \
-    #                                                 matvec=StkK_apply, \
-    #                                                 dtype=jnp.complex128)
-    # x, info = scipy.sparse.linalg.gmres(gmres_func, BC_pot.flatten(), x0=jnp.zeros(total_dofs, dtype=jnp.complex128), \
-    #                                     atol = 1e-14, rtol = 1e-13, maxiter=200)
-    # sig_gmres = x.reshape(theta.shape[0], theta.shape[1], 3)
-    # bc_check = bio_onsurf_apply(x, theta, phi, sh, sl_scal, dl_scal, sgn)
-    # resid_gmres = jnp.linalg.norm(bc_check - BC_pot.flatten())
-    # print("Residual of GMRES solve = {a}, exitcode (0:successful): {b}".format(a=resid_gmres, b=info))
+    gmres_func = lx.FunctionLinearOperator(
+        StkK_apply, jax.eval_shape(lambda: jnp.zeros(S["Xcart"].shape, dtype=jnp.complex128))
+    )
+    solver = lx.GMRES(rtol=1e-10, atol=1e-12, max_steps=200)
+    solution = lx.linear_solve(
+        gmres_func,
+        BC_pot,
+        solver=solver,
+        options={"y0": jnp.zeros(S["Xcart"].shape, dtype=jnp.complex128)},
+    )
+    sig_gmres = solution.value 
+    stats = solution.stats
+    # Manually check residual
+    bc_check = bio_onsurf_apply(sig_gmres, theta, phi, sh, sl_scal, dl_scal, sgn)
+    resid_gmres = jnp.linalg.norm(bc_check - BC_pot)
+    jax.debug.print("Residual of GMRES solve = {a}, number of iterations = {b}", a=resid_gmres, b=stats["num_steps"])
 
     # DIRECT solve
     sig_direct = stokes_onsurf_direct_solve(BC_pot, theta, phi, sh, sl_scal, dl_scal, sgn)
-    bc_check_direct = bio_onsurf_apply(sig_direct.flatten(), theta, phi, sh, sl_scal, dl_scal, sgn)
-    resid_direct = jnp.linalg.norm(bc_check_direct - BC_pot.flatten())
+    bc_check_direct = bio_onsurf_apply(sig_direct, theta, phi, sh, sl_scal, dl_scal, sgn)
+    resid_direct = jnp.linalg.norm(bc_check_direct - BC_pot)
     print("Residual of DIRECT solve = {a}".format(a=resid_direct))
 
     # Accuracy
@@ -451,18 +456,17 @@ if __name__ == "__main__":
     true_field = jnp.reshape(true_field, Strg["Xcart"].shape)
     true_field = jnp.real(true_field)
 
-    # S = set_density(S, sig_gmres[:,:,0], sig_gmres[:,:,1], sig_gmres[:,:,2])
-    # Ksig_gmres = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
-    # Ksig_gmres = jnp.real(Ksig_gmres)
+    S = set_density(S, sig_gmres[:,:,0], sig_gmres[:,:,1], sig_gmres[:,:,2])
+    Ksig_gmres = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
+    Ksig_gmres = jnp.real(Ksig_gmres)
 
     S = set_density(S, sig_direct[:,:,0], sig_direct[:,:,1], sig_direct[:,:,2])
     Ksig_direct = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
     Ksig_direct = jnp.real(Ksig_direct)
 
-    # diff_gmres = jnp.max(true_field - Ksig_gmres) / jnp.max(true_field)
+    diff_gmres = jnp.max(true_field - Ksig_gmres) / jnp.max(true_field)
     diff_direct = jnp.max(true_field - Ksig_direct) / jnp.max(true_field)
-    # print("Max relative error of order {lmax} solver at target radius {Rtrg} for GMRES solver is {d1}, for direct solver is {d2}".format(lmax=lmax, Rtrg=Rtrg, d1=diff_gmres, d2=diff_direct))
-    print("Max relative error of order {lmax} solver at target radius {Rtrg} for direct solver is {d2}".format(lmax=lmax, Rtrg=Rtrg, d2=diff_direct))
+    print("Max relative error of order {lmax} solver at target radius {Rtrg} for GMRES solver is {d1}, for direct solver is {d2}".format(lmax=lmax, Rtrg=Rtrg, d1=diff_gmres, d2=diff_direct))
 
 
     # Targets -- interior
@@ -493,21 +497,27 @@ if __name__ == "__main__":
         dl_scal=dl_scal, 
         sgn=sgn
     )
-    # total_dofs = S["Xcart"].size
-    # gmres_func = scipy.sparse.linalg.LinearOperator((total_dofs, total_dofs), \
-    #                                                 matvec=StkK_apply, \
-    #                                                 dtype=jnp.complex128)
-    # x, info = scipy.sparse.linalg.gmres(gmres_func, BC_pot.flatten(), x0=jnp.zeros(total_dofs, dtype=jnp.complex128), \
-    #                                     atol = 1e-14, rtol = 1e-13, maxiter=200)
-    # sig_gmres = x.reshape(theta.shape[0], theta.shape[1], 3)
-    # bc_check = bio_onsurf_apply(x, theta, phi, sh, sl_scal, dl_scal, sgn)
-    # resid_gmres = jnp.linalg.norm(bc_check - BC_pot.flatten())
-    # print("Residual of GMRES solve = {a}, exitcode (0:successful): {b}".format(a=resid_gmres, b=info))
+    gmres_func = lx.FunctionLinearOperator(
+        StkK_apply, jax.eval_shape(lambda: jnp.zeros(S["Xcart"].shape, dtype=jnp.complex128))
+    )
+    solver = lx.GMRES(rtol=1e-10, atol=1e-12, max_steps=200)
+    solution = lx.linear_solve(
+        gmres_func,
+        BC_pot,
+        solver=solver,
+        options={"y0": jnp.zeros(S["Xcart"].shape, dtype=jnp.complex128)},
+    )
+    sig_gmres = solution.value 
+    stats = solution.stats
+    # Manually check residual
+    bc_check = bio_onsurf_apply(sig_gmres, theta, phi, sh, sl_scal, dl_scal, sgn)
+    resid_gmres = jnp.linalg.norm(bc_check - BC_pot)
+    jax.debug.print("Residual of GMRES solve = {a}, number of iterations = {b}", a=resid_gmres, b=stats["num_steps"])
 
     # DIRECT solve
     sig_direct = stokes_onsurf_direct_solve(BC_pot, theta, phi, sh, sl_scal, dl_scal, sgn)
-    bc_check_direct = bio_onsurf_apply(sig_direct.flatten(), theta, phi, sh, sl_scal, dl_scal, sgn)
-    resid_diag = jnp.linalg.norm(bc_check_direct - BC_pot.flatten())
+    bc_check_direct = bio_onsurf_apply(sig_direct, theta, phi, sh, sl_scal, dl_scal, sgn)
+    resid_diag = jnp.linalg.norm(bc_check_direct - BC_pot)
     print("Residual of DIRECT solve = {a}".format(a=resid_diag))
 
     # Accuracy
@@ -519,15 +529,14 @@ if __name__ == "__main__":
     true_field = jnp.reshape(true_field, S["Xcart"].shape)
     true_field = jnp.real(true_field)
 
-    # S = set_density(S, sig_gmres[:,:,0], sig_gmres[:,:,1], sig_gmres[:,:,2])
-    # Ksig_gmres = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
-    # Ksig_gmres = jnp.real(Ksig_gmres)
+    S = set_density(S, sig_gmres[:,:,0], sig_gmres[:,:,1], sig_gmres[:,:,2])
+    Ksig_gmres = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
+    Ksig_gmres = jnp.real(Ksig_gmres)
 
     S = set_density(S, sig_direct[:,:,0], sig_direct[:,:,1], sig_direct[:,:,2])
     Ksig_direct = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
     Ksig_direct = jnp.real(Ksig_direct)
 
-    # diff_gmres = jnp.max(true_field - Ksig_gmres) / jnp.max(true_field)
+    diff_gmres = jnp.max(true_field - Ksig_gmres) / jnp.max(true_field)
     diff_direct = jnp.max(true_field - Ksig_direct) / jnp.max(true_field)
-    # print("Max relative error of order {lmax} solver at target radius {Rtrg} for GMRES solver is {d1}, for direct solver is {d2}".format(lmax=lmax, Rtrg=Rtrg, d1=diff_gmres, d2=diff_direct))
-    print("Max relative error of order {lmax} solver at target radius {Rtrg} for direct solver is {d2}".format(lmax=lmax, Rtrg=Rtrg,  d2=diff_direct))
+    print("Max relative error of order {lmax} solver at target radius {Rtrg} for GMRES solver is {d1}, for direct solver is {d2}".format(lmax=lmax, Rtrg=Rtrg, d1=diff_gmres, d2=diff_direct))
