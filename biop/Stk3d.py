@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import lineax as lx
 import shtns
 import shtns_jax
+import matplotlib.pyplot as plt
 
 import os
 import sys
@@ -137,6 +138,79 @@ def Stk3d_dl_VWX_diag(sh: shtns_jax.sht) -> tuple([jax.Array, jax.Array, jax.Arr
     diag_X_int = -(l_vals + 2.0) / (2.0*l_vals + 1.0)
 
     return diag_V_ext, diag_W_ext, diag_X_ext, diag_V_int, diag_W_int, diag_X_int
+
+def Stk3d_dsl_VWX_diag(sh: shtns_jax.sht) -> tuple([jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]):
+    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
+
+    diag_V_int = (2.0*l_vals*l_vals + 4*l_vals + 3) / (2.0*l_vals + 1.0) / (2.0*l_vals + 3.0)
+    diag_W_int = 2.0*(l_vals + 1.0)*(l_vals - 1.0) / (2.0*l_vals + 1.0) / (2.0*l_vals - 1.0)
+    diag_X_int = (l_vals - 1.0) / (2.0*l_vals + 1.0)
+
+    diag_V_ext = -2.0*l_vals*(l_vals + 2) / (2.0*l_vals + 1.0) / (2.0*l_vals + 3.0)
+    diag_W_ext = -(2.0*l_vals*l_vals + 1.0) / (2.0*l_vals + 1.0) / (2.0*l_vals - 1.0)
+    diag_X_ext = -(l_vals + 2.0) / (2.0*l_vals + 1.0)
+
+    return diag_V_ext, diag_W_ext, diag_X_ext, diag_V_int, diag_W_int, diag_X_int
+
+def Stk3d_sl_far(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
+    """
+    Off-surface evaluation of the Stokes SL (Stokeslet) velocity with the vector
+    density S["Sigma"]
+        with <trg>: Ntrg x 3
+        using the smooth surface quadrature (accurate only for targets well
+        away from the surface).
+    Returns the velocity at the targets: Ntrg x 3.
+
+    Stokeslet kernel (matches compute_field): with r = trg - src, d = |r|,
+        u_j(x) = (1/8pi) sum_src [ sigma_j / d + r_j (r.sigma) / d^3 ] * w.
+    """
+    assert trg.shape[1] == 3
+
+    # Flatten the (nphi, ntheta, ...) grid arrays to per-source-point lists.
+    grid_shape = S["Xcart"].shape[:2]
+    ysrc = S["Xcart"].reshape(-1, 3)        # Nsrc x 3
+    fsrc = S["Sigma"].reshape(-1, 3)        # Nsrc x 3, vector density
+    # Gauss weights (1 x ntheta) broadcast over the (nphi, ntheta) grid, plus
+    # the r^2 surface Jacobian for a sphere of radius S["r"].
+    wts = jnp.broadcast_to(sh._grid_weights(), grid_shape).reshape(-1) * S["r"] ** 2
+
+    r = trg[:, None, :] - ysrc[None, :, :]  # Ntrg x Nsrc x 3, convention r = trg - src
+    d = jnp.linalg.norm(r, axis=2)          # Ntrg x Nsrc
+    rdotf = jnp.sum(r * fsrc[None, :, :], axis=2)  # Ntrg x Nsrc
+    term = fsrc[None, :, :] / d[..., None] + r * (rdotf / d ** 3)[..., None]
+    prefac = 1.0 / 8.0 / jnp.pi
+    SL_sigma = prefac * jnp.sum(term * wts[None, :, None], axis=1)  # Ntrg x 3
+    return SL_sigma
+
+def Stk3d_dl_far(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
+    """
+    Off-surface evaluation of the Stokes DL (stresslet) velocity with the vector
+    density S["Sigma"]
+        with <trg>: Ntrg x 3
+        using the smooth surface quadrature (accurate only for targets well
+        away from the surface).
+    Returns the velocity at the targets: Ntrg x 3.
+
+    Stresslet kernel T_ijk = 6 r_i r_j r_k / d^5. With r = trg - src, d = |r|,
+    unit outward normal n = S["Xncart"] and density sigma = S["Sigma"],
+        u_j(x) = (6/8pi) sum_src [ (r.sigma)(r.n) / d^5 ] r_j * w.
+    The sign matches the spectral Stk3d_dl_r_1sph convention (verified in __main__).
+    """
+    assert trg.shape[1] == 3
+
+    grid_shape = S["Xcart"].shape[:2]
+    ysrc = S["Xcart"].reshape(-1, 3)        # Nsrc x 3
+    fsrc = S["Sigma"].reshape(-1, 3)        # Nsrc x 3, vector density
+    nsrc = S["Xncart"].reshape(-1, 3)       # Nsrc x 3, unit outward normals
+    wts = jnp.broadcast_to(sh._grid_weights(), grid_shape).reshape(-1) * S["r"] ** 2
+
+    r = trg[:, None, :] - ysrc[None, :, :]  # Ntrg x Nsrc x 3, convention r = trg - src
+    d = jnp.linalg.norm(r, axis=2)          # Ntrg x Nsrc
+    rdotn = jnp.sum(r * nsrc[None, :, :], axis=2)   # Ntrg x Nsrc
+    rdots = jnp.sum(r * fsrc[None, :, :], axis=2)   # Ntrg x Nsrc
+    prefac = 6.0 / 8.0 / jnp.pi
+    DL_sigma = prefac * jnp.sum(r * (rdotn * rdots / d ** 5 * wts[None, :])[..., None], axis=1)
+    return DL_sigma
 
 def Stk3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
@@ -275,7 +349,129 @@ def Stk3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: s
 
     return DL_sigma
 
-def bio_onsurf_apply(sigma_tens: jax.Array, theta: jax.Array, phi: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float) -> jax.Array:
+def _stk_trg_sph(trg: jax.Array, S: SphereDict) -> tuple([jax.Array, jax.Array, jax.Array]):
+    """Spherical coordinates (dr, theta, phi) of targets <trg> relative to S["Xc"]."""
+    trg_dx = trg[:,0] - S["Xc"][0]
+    trg_dy = trg[:,1] - S["Xc"][1]
+    trg_dz = trg[:,2] - S["Xc"][2]
+    trg_dr = jnp.sqrt(trg_dx*trg_dx + trg_dy*trg_dy + trg_dz*trg_dz)
+    trg_phi = jnp.atan2(trg_dy, trg_dx)
+    trg_theta = jnp.acos(trg_dz / trg_dr)
+    return trg_dr, trg_theta, trg_phi
+
+def _stk_qst_to_points(qlm: jax.Array, slm: jax.Array, tlm: jax.Array, trg_theta: jax.Array, trg_phi: jax.Array, sh: shtns_jax.sht) -> jax.Array:
+    """Evaluate the complex Q/S/T vector expansion (per-target coefficients,
+    shape Ntrg x nlm_cplx) at the target points (trg_theta, trg_phi) and return
+    the Cartesian velocity Ntrg x 3.  Mirrors the per-target loop of Lap3d_dl: the
+    point synthesis uses the scalar shtns SHqst_to_point_cplx, only the C call is
+    looped (coefficients differ per target)."""
+    qlm = np.asarray(qlm, dtype=np.complex128)
+    slm = np.asarray(slm, dtype=np.complex128)
+    tlm = np.asarray(tlm, dtype=np.complex128)
+    cost = np.cos(np.asarray(trg_theta))
+    vals = []
+    for i in range(qlm.shape[0]):
+        vr, vt, vp = sh.SHqst_to_point_cplx(qlm[i], slm[i], tlm[i], float(cost[i]), float(trg_phi[i]))
+        vx, vy, vz = sph2cart(vr, vt, vp, trg_theta[i], trg_phi[i])
+        vals.append([vx, vy, vz])
+    return jnp.array(vals, dtype=jnp.complex128)
+
+def Stk3d_sl(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
+    """
+    Off-surface evaluation of the Stokes SL velocity at arbitrary points <trg>: Ntrg x 3
+        From source <S> with density <S["Sigma"]>, source uses SHT object <sh>.
+    Spectral solid-harmonic scaling identical to Stk3d_sl_r_1sph, but per-target
+    radius and point synthesis.  Returns Ntrg x 3.
+    """
+    assert trg.shape[1] == 3
+    if S["lmax"] != sh.lmax:
+        print("S lmax does not match sht's lmax, reform sht.")
+        sh = shtns_jax.sht(S["lmax"], S["lmax"])
+
+    vlm_sigma, wlm_sigma, xlm_sigma = sig_xyz2vwx(
+        S["Sigma"][:,:,0], S["Sigma"][:,:,1], S["Sigma"][:,:,2],
+        S["Xsph"][:,:,0], S["Xsph"][:,:,1], sh)
+
+    trg_dr, trg_theta, trg_phi = _stk_trg_sph(trg, S)
+    trg_dr = trg_dr[:,None]   # Ntrg x 1, broadcasts against (nlm,)
+    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
+    diag_V, diag_W, diag_X = Stk3d_sl_VWX_diag(sh)
+
+    vlm_ext = trg_dr ** (-l_vals-2.0) * diag_V * vlm_sigma
+    vlm_int = trg_dr ** (l_vals+1.0) * diag_V * vlm_sigma
+    wlm_ext = trg_dr ** (-l_vals) * diag_W * wlm_sigma
+    wlm_int = trg_dr ** (l_vals-1.0) * diag_W * wlm_sigma
+    xlm_ext = trg_dr ** (-l_vals-1.0) * diag_X * xlm_sigma
+    xlm_int = trg_dr ** (l_vals) * diag_X * xlm_sigma
+
+    diag_V2W_int = (l_vals+1.0) / (4.0*l_vals+2.0)
+    diag_W2V_ext = l_vals / (4.0*l_vals+2.0)
+    V2Wlm_int = (trg_dr ** (l_vals+1.0) - trg_dr ** (l_vals-1.0)) * diag_V2W_int * vlm_sigma
+    W2Vlm_ext = (trg_dr ** (-l_vals-2.0) - trg_dr ** (-l_vals)) * diag_W2V_ext * wlm_sigma
+
+    is_ext = trg_dr > S['r']
+    vlm = jnp.where(is_ext, vlm_ext + W2Vlm_ext, vlm_int)
+    wlm = jnp.where(is_ext, wlm_ext, wlm_int + V2Wlm_int)
+    xlm = jnp.where(is_ext, xlm_ext, xlm_int)
+
+    qlm, slm, tlm = vwx2qst(vlm, wlm, xlm, sh)
+    return _stk_qst_to_points(qlm, slm, tlm, trg_theta, trg_phi, sh)
+
+def Stk3d_dl(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
+    """
+    Off-surface evaluation of the Stokes DL velocity at arbitrary points <trg>: Ntrg x 3
+        From source <S> with density <S["Sigma"]>, source uses SHT object <sh>.
+    Spectral solid-harmonic scaling identical to Stk3d_dl_r_1sph, but per-target
+    radius and point synthesis.  Returns Ntrg x 3.
+    """
+    assert trg.shape[1] == 3
+    if S["lmax"] != sh.lmax:
+        print("S lmax does not match sht's lmax, reform sht.")
+        sh = shtns_jax.sht(S["lmax"], S["lmax"])
+
+    vlm_sigma, wlm_sigma, xlm_sigma = sig_xyz2vwx(
+        S["Sigma"][:,:,0], S["Sigma"][:,:,1], S["Sigma"][:,:,2],
+        S["Xsph"][:,:,0], S["Xsph"][:,:,1], sh)
+
+    trg_dr, trg_theta, trg_phi = _stk_trg_sph(trg, S)
+    trg_dr = trg_dr[:,None]
+    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
+    diag_V_ext, diag_W_ext, diag_X_ext, diag_V_int, diag_W_int, diag_X_int = Stk3d_dl_VWX_diag(sh)
+
+    vlm_ext = trg_dr ** (-l_vals-2.0) * diag_V_ext * vlm_sigma
+    vlm_int = trg_dr ** (l_vals+1.0) * diag_V_int * vlm_sigma
+    wlm_ext = trg_dr ** (-l_vals) * diag_W_ext * wlm_sigma
+    wlm_int = trg_dr ** (l_vals-1.0) * diag_W_int * wlm_sigma
+    xlm_ext = trg_dr ** (-l_vals-1.0) * diag_X_ext * xlm_sigma
+    xlm_int = trg_dr ** (l_vals) * diag_X_int * xlm_sigma
+
+    diag_V2W_int = (l_vals+1.0) * (l_vals+2.0) / (2.0*l_vals+1.0)
+    diag_W2V_ext = 2. * l_vals * (l_vals-1.0) / (4.0*l_vals+2.0)
+    V2Wlm_int = (-trg_dr ** (l_vals+1.0) + trg_dr ** (l_vals-1.0)) * diag_V2W_int * vlm_sigma
+    W2Vlm_ext = (trg_dr ** (-l_vals-2.0) - trg_dr ** (-l_vals)) * diag_W2V_ext * wlm_sigma
+
+    is_ext = trg_dr > S['r']
+    vlm = jnp.where(is_ext, vlm_ext + W2Vlm_ext, vlm_int)
+    wlm = jnp.where(is_ext, wlm_ext, wlm_int + V2Wlm_int)
+    xlm = jnp.where(is_ext, xlm_ext, xlm_int)
+
+    qlm, slm, tlm = vwx2qst(vlm, wlm, xlm, sh)
+    return _stk_qst_to_points(qlm, slm, tlm, trg_theta, trg_phi, sh)
+
+def bio_offsurf_apply(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, far: bool = False) -> jax.Array:
+    """
+    Evaluate the KL formulation of <S> with density <S["Sigma"]> at arbitrary target <trg>: Ntrg x 3.
+    """
+    if not far:
+        SLsigma = Stk3d_sl(trg, S, sh)
+        DLsigma = Stk3d_dl(trg, S, sh)
+    else:
+        SLsigma = Stk3d_sl_far(trg, S, sh)
+        DLsigma = Stk3d_dl_far(trg, S, sh)
+    Ksigma = sl_scal * SLsigma + dl_scal * DLsigma
+    return Ksigma
+
+def bio_onsurf_apply(sigma_tens: jax.Array, theta: jax.Array, phi: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0.) -> jax.Array:
     """
     Apply the combined DL potential operator K = sl_scal * SL + dl_scal * DL
         to the density <sigma_tens> defined on the <sh> grid
@@ -298,19 +494,24 @@ def bio_onsurf_apply(sigma_tens: jax.Array, theta: jax.Array, phi: jax.Array, sh
     wlm_DL_sigma = 0.5*(diag_W_int + diag_W_ext) * wlm
     xlm_DL_sigma = 0.5*(diag_X_int + diag_X_ext) * xlm
 
-    vlm_op = sl_scal * vlm_SL_sigma + dl_scal * vlm_DL_sigma
-    wlm_op = sl_scal * wlm_SL_sigma + dl_scal * wlm_DL_sigma
-    xlm_op = sl_scal * xlm_SL_sigma + dl_scal * xlm_DL_sigma
+    diag_V_ext, diag_W_ext, diag_X_ext, diag_V_int, diag_W_int, diag_X_int = Stk3d_dsl_VWX_diag(sh)
+    vlm_dSL_sigma = 0.5*(diag_V_int + diag_V_ext) * vlm
+    wlm_dSL_sigma = 0.5*(diag_W_int + diag_W_ext) * wlm
+    xlm_dSL_sigma = 0.5*(diag_X_int + diag_X_ext) * xlm
+
+    vlm_op = sl_scal * vlm_SL_sigma + dl_scal * vlm_DL_sigma + dsl_scal * vlm_dSL_sigma
+    wlm_op = sl_scal * wlm_SL_sigma + dl_scal * wlm_DL_sigma + dsl_scal * wlm_dSL_sigma
+    xlm_op = sl_scal * xlm_SL_sigma + dl_scal * xlm_DL_sigma + dsl_scal * xlm_dSL_sigma
 
     vx,vy,vz = sig_vwx2xyz(vlm_op,wlm_op,xlm_op,theta,phi,sh)
-    vx = vx + 0.5 * sgn * dl_scal * sigma_x
-    vy = vy + 0.5 * sgn * dl_scal * sigma_y
-    vz = vz + 0.5 * sgn * dl_scal * sigma_z
+    vx = vx + 0.5 * sgn * dl_scal * sigma_x + 0.5 * (-1*sgn) * dsl_scal * sigma_x
+    vy = vy + 0.5 * sgn * dl_scal * sigma_y + 0.5 * (-1*sgn) * dsl_scal * sigma_y
+    vz = vz + 0.5 * sgn * dl_scal * sigma_z + 0.5 * (-1*sgn) * dsl_scal * sigma_z
     V = jnp.stack([vx, vy, vz], axis=2)
 
     return V
 
-def stokes_onsurf_direct_solve(bc_vec: jax.Array, theta: jax.Array, phi: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float) -> jax.Array:
+def stokes_onsurf_direct_solve(bc_vec: jax.Array, theta: jax.Array, phi: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0.) -> jax.Array:
     """
     Directly solves the Stokes BIO equation using the VWX diagonal property.
     """
@@ -321,10 +522,14 @@ def stokes_onsurf_direct_solve(bc_vec: jax.Array, theta: jax.Array, phi: jax.Arr
     diag_V_dl = 0.5 * (diag_V_int + diag_V_ext)
     diag_W_dl = 0.5 * (diag_W_int + diag_W_ext)
     diag_X_dl = 0.5 * (diag_X_int + diag_X_ext)
+    diag_V_ext, diag_W_ext, diag_X_ext, diag_V_int, diag_W_int, diag_X_int = Stk3d_dsl_VWX_diag(sh)
+    diag_V_dsl = 0.5 * (diag_V_int + diag_V_ext)
+    diag_W_dsl = 0.5 * (diag_W_int + diag_W_ext)
+    diag_X_dsl = 0.5 * (diag_X_int + diag_X_ext)
     
-    op_diag_V = (0.5 * dl_scal * sgn) + (dl_scal * diag_V_dl) + (sl_scal * diag_V_sl)
-    op_diag_W = (0.5 * dl_scal * sgn) + (dl_scal * diag_W_dl) + (sl_scal * diag_W_sl)
-    op_diag_X = (0.5 * dl_scal * sgn) + (dl_scal * diag_X_dl) + (sl_scal * diag_X_sl)
+    op_diag_V = (0.5 * dl_scal * sgn) + (dl_scal * diag_V_dl) + (sl_scal * diag_V_sl) + (0.5 * dsl_scal * (-1*sgn)) + (dsl_scal * diag_V_dsl)
+    op_diag_W = (0.5 * dl_scal * sgn) + (dl_scal * diag_W_dl) + (sl_scal * diag_W_sl) + (0.5 * dsl_scal * (-1*sgn)) + (dsl_scal * diag_W_dsl)
+    op_diag_X = (0.5 * dl_scal * sgn) + (dl_scal * diag_X_dl) + (sl_scal * diag_X_sl) + (0.5 * dsl_scal * (-1*sgn)) + (dsl_scal * diag_X_dsl)
 
     eps = 1e-14
     def safe_div(bc_lm, op_diag):
@@ -379,6 +584,39 @@ def compute_field(trg: jax.Array, src: jax.Array, force: jax.Array) -> jax.Array
     u = jnp.sum(u_contrib, axis=1)  
     
     return u.astype(jnp.complex128)
+
+def compute_traction(trg: jax.Array, trgN: jax.Array, src: jax.Array, force: jax.Array) -> jax.Array:
+    """
+    Compute the field generated by Stokeslets
+        positioned at <src>: Nsrc x 3 
+        with strenght <force>: Nsrc x 3
+        at target positioned at <trg>: Ntrg x 3 with target normal <trgN>: Ntrg x 3
+    """
+
+    assert trg.shape[1] == 3 and trgN.shape[1] == 3 and src.shape[1] == 3 and force.shape[1] == 3
+    assert force.shape[0] == src.shape[0]
+
+    srcx = src[:,0][None,:] 
+    srcy = src[:,1][None,:]
+    srcz = src[:,2][None,:]
+    dx = trg[:,0][:,None] - srcx 
+    dy = trg[:,1][:,None] - srcy
+    dz = trg[:,2][:,None] - srcz
+    dr = jnp.sqrt(dx*dx + dy*dy + dz*dz)
+    
+    r_vec = jnp.stack([dx, dy, dz], axis=-1) 
+    r_norm = dr[..., None]  
+    invr = 1./r_norm
+    invr3 = invr * invr * invr
+
+    force_expanded = force[None, :, :]  
+    rdotf = jnp.sum(force_expanded * r_vec, axis=-1, keepdims=True)  
+    trgN_expanded = trgN[:, None, :]
+    rdotn = jnp.sum(trgN_expanded * r_vec, axis=-1, keepdims=True)  
+    u_contrib = -(3/(4*jnp.pi)) * (rdotf * r_vec * rdotn * invr3 * invr * invr)
+    u = jnp.sum(u_contrib, axis=1)  
+    
+    return u.astype(jnp.complex128)
     
 if __name__ == "__main__":
     """
@@ -396,6 +634,7 @@ if __name__ == "__main__":
     dl_scal = 1.0
 
     # Targets -- exterior
+    print("\n Manufactured solutions test Stokes 3D solver on the unit sphere ---- Exterior Dirichlet problem")
     Rtrg = radius * 1.025
     sgn = 1.0 
     Strg = build_sphere(center, Rtrg)
@@ -414,33 +653,6 @@ if __name__ == "__main__":
     BC_pot = compute_field(trg_sphere, ptsrc, force)
     BC_pot = jnp.reshape(BC_pot, S["Xcart"].shape)
 
-    # GMRES solve
-    StkK_apply = partial(
-        bio_onsurf_apply,
-        theta = theta,
-        phi = phi,
-        sh=sh,
-        sl_scal=sl_scal, 
-        dl_scal=dl_scal, 
-        sgn=sgn
-    )
-    gmres_func = lx.FunctionLinearOperator(
-        StkK_apply, jax.eval_shape(lambda: jnp.zeros(S["Xcart"].shape, dtype=jnp.complex128))
-    )
-    solver = lx.GMRES(rtol=1e-10, atol=1e-12, max_steps=200)
-    solution = lx.linear_solve(
-        gmres_func,
-        BC_pot,
-        solver=solver,
-        options={"y0": jnp.zeros(S["Xcart"].shape, dtype=jnp.complex128)},
-    )
-    sig_gmres = solution.value 
-    stats = solution.stats
-    # Manually check residual
-    bc_check = bio_onsurf_apply(sig_gmres, theta, phi, sh, sl_scal, dl_scal, sgn)
-    resid_gmres = jnp.linalg.norm(bc_check - BC_pot)
-    jax.debug.print("Residual of GMRES solve = {a}, number of iterations = {b}", a=resid_gmres, b=stats["num_steps"])
-
     # DIRECT solve
     sig_direct = stokes_onsurf_direct_solve(BC_pot, theta, phi, sh, sl_scal, dl_scal, sgn)
     bc_check_direct = bio_onsurf_apply(sig_direct, theta, phi, sh, sl_scal, dl_scal, sgn)
@@ -456,20 +668,54 @@ if __name__ == "__main__":
     true_field = jnp.reshape(true_field, Strg["Xcart"].shape)
     true_field = jnp.real(true_field)
 
-    S = set_density(S, sig_gmres[:,:,0], sig_gmres[:,:,1], sig_gmres[:,:,2])
-    Ksig_gmres = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
-    Ksig_gmres = jnp.real(Ksig_gmres)
-
     S = set_density(S, sig_direct[:,:,0], sig_direct[:,:,1], sig_direct[:,:,2])
     Ksig_direct = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
     Ksig_direct = jnp.real(Ksig_direct)
 
-    diff_gmres = jnp.max(true_field - Ksig_gmres) / jnp.max(true_field)
     diff_direct = jnp.max(true_field - Ksig_direct) / jnp.max(true_field)
-    print("Max relative error of order {lmax} solver at target radius {Rtrg} for GMRES solver is {d1}, for direct solver is {d2}".format(lmax=lmax, Rtrg=Rtrg, d1=diff_gmres, d2=diff_direct))
+    print("Max relative error of order {lmax} solver at target radius {Rtrg} for direct solver is {d}".format(lmax=lmax, Rtrg=Rtrg, d=diff_direct))
+
+
+    print("\n Manufactured solutions test Stokes 3D solver on the unit sphere ---- Exterior Neumann problem")
+    # Formulation: u(x) = S[sigma](x), match du/dn(gamma) = dSn[sigma](gamma)
+    xn = S["Xncart"][:,:,0]
+    yn = S["Xncart"][:,:,1]
+    zn = S["Xncart"][:,:,2]
+    trgN_sphere = jnp.column_stack([jnp.reshape(xn,-1), jnp.reshape(yn,-1), jnp.reshape(zn,-1)])
+    BC_flux = compute_traction(trg_sphere, trgN_sphere, ptsrc, force) 
+    BC_flux = jnp.reshape(BC_flux, S["Xcart"].shape)
+    # DIRECT solve
+    sig_direct = stokes_onsurf_direct_solve(
+        BC_flux, theta, phi,
+        sh=sh,
+        sl_scal=0.,
+        dl_scal=0.,
+        sgn=sgn,
+        dsl_scal=1.0
+    )
+    bc_check_direct = bio_onsurf_apply(sig_direct, theta, phi, sh, 0., 0., sgn, 1.0)
+    resid_direct = jnp.linalg.norm(bc_check_direct - BC_flux)
+    jax.debug.print("Residual of DIRECT solve: {a}", a=resid_direct)
+    # Accuracy
+    xtrg = Strg["Xcart"][:,:,0] 
+    ytrg = Strg["Xcart"][:,:,1]
+    ztrg = Strg["Xcart"][:,:,2]
+    trg_sphere2 = jnp.column_stack([jnp.reshape(xtrg,-1), jnp.reshape(ytrg,-1), jnp.reshape(ztrg,-1)])
+    true_field = compute_field(trg_sphere2, ptsrc, force)
+    true_field = jnp.reshape(true_field, Strg["Xcart"].shape)
+    true_field = jnp.real(true_field)
+
+    S = set_density(S, sig_direct[:,:,0], sig_direct[:,:,1], sig_direct[:,:,2])
+    Ksig_direct = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, 1.0, 0.)
+    Ksig_direct = jnp.real(Ksig_direct)
+
+    diff_direct = jnp.max(true_field - Ksig_direct) / jnp.max(true_field)
+    jax.debug.print("Max relative error of order {lmax} solver at target radius {Rtrg} for direct solver is {d}", lmax=lmax, Rtrg=Rtrg, d=diff_direct)
+
 
 
     # Targets -- interior
+    print("\n Manufactured solutions test Stokes 3D solver on the unit sphere ---- Interior Dirichlet problem")
     Rtrg = radius * 0.5
     sgn = -1.0
     Strg = build_sphere(center, Rtrg)
@@ -487,33 +733,6 @@ if __name__ == "__main__":
     BC_pot = compute_field(trg_sphere, ptsrc, force)
     BC_pot = jnp.reshape(BC_pot, S["Xcart"].shape)
 
-    # GMRES solve
-    StkK_apply = partial(
-        bio_onsurf_apply,
-        theta = theta,
-        phi = phi,
-        sh=sh,
-        sl_scal=sl_scal, 
-        dl_scal=dl_scal, 
-        sgn=sgn
-    )
-    gmres_func = lx.FunctionLinearOperator(
-        StkK_apply, jax.eval_shape(lambda: jnp.zeros(S["Xcart"].shape, dtype=jnp.complex128))
-    )
-    solver = lx.GMRES(rtol=1e-10, atol=1e-12, max_steps=200)
-    solution = lx.linear_solve(
-        gmres_func,
-        BC_pot,
-        solver=solver,
-        options={"y0": jnp.zeros(S["Xcart"].shape, dtype=jnp.complex128)},
-    )
-    sig_gmres = solution.value 
-    stats = solution.stats
-    # Manually check residual
-    bc_check = bio_onsurf_apply(sig_gmres, theta, phi, sh, sl_scal, dl_scal, sgn)
-    resid_gmres = jnp.linalg.norm(bc_check - BC_pot)
-    jax.debug.print("Residual of GMRES solve = {a}, number of iterations = {b}", a=resid_gmres, b=stats["num_steps"])
-
     # DIRECT solve
     sig_direct = stokes_onsurf_direct_solve(BC_pot, theta, phi, sh, sl_scal, dl_scal, sgn)
     bc_check_direct = bio_onsurf_apply(sig_direct, theta, phi, sh, sl_scal, dl_scal, sgn)
@@ -529,14 +748,72 @@ if __name__ == "__main__":
     true_field = jnp.reshape(true_field, S["Xcart"].shape)
     true_field = jnp.real(true_field)
 
-    S = set_density(S, sig_gmres[:,:,0], sig_gmres[:,:,1], sig_gmres[:,:,2])
-    Ksig_gmres = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
-    Ksig_gmres = jnp.real(Ksig_gmres)
-
     S = set_density(S, sig_direct[:,:,0], sig_direct[:,:,1], sig_direct[:,:,2])
     Ksig_direct = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
     Ksig_direct = jnp.real(Ksig_direct)
 
-    diff_gmres = jnp.max(true_field - Ksig_gmres) / jnp.max(true_field)
     diff_direct = jnp.max(true_field - Ksig_direct) / jnp.max(true_field)
-    print("Max relative error of order {lmax} solver at target radius {Rtrg} for GMRES solver is {d1}, for direct solver is {d2}".format(lmax=lmax, Rtrg=Rtrg, d1=diff_gmres, d2=diff_direct))
+    print("Max relative error of order {lmax} solver at target radius {Rtrg} for direct solver is {d}".format(lmax=lmax, Rtrg=Rtrg, d=diff_direct))
+
+    # Arbitrary-point spectral eval (bio_offsurf_apply) vs the grid _1sph path
+    #   for interior targets (exercises the interior solid-harmonic / V2W branch).
+    trg_grid = jnp.column_stack([
+        jnp.reshape(Strg["Xcart"][:, :, 0], -1),
+        jnp.reshape(Strg["Xcart"][:, :, 1], -1),
+        jnp.reshape(Strg["Xcart"][:, :, 2], -1),
+    ])
+    K_1sph = jnp.real(jnp.reshape(bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal), (-1, 3)))
+    K_pt = jnp.real(bio_offsurf_apply(trg_grid, S, sh, sl_scal, dl_scal, far=False))
+    err_pt = jnp.max(jnp.abs(K_pt - K_1sph)) / jnp.max(jnp.abs(K_1sph))
+    jax.debug.print("Max relative error of bio_offsurf_apply (point eval) vs bio_offsurf_apply_1sph at radius {Rtrg} = {e}", Rtrg=Rtrg, e=err_pt)
+
+
+    # Interior vector-field visualization of the Stokes velocity (quiver).
+    #   Same z-slice target grid as Lap3d, but coarse (quiver needs sparse arrows)
+    #   and combining the near/far evaluations via separate_target.
+    z_slices = [-0.5, 0.0, 0.5]
+    Ng = 10  # even so the grid excludes the polar axis x=y=0 (sin(theta)=0 singularity)
+    gx = jnp.linspace(-radius, radius, Ng)
+    gy = jnp.linspace(-radius, radius, Ng)
+    Xg, Yg = jnp.meshgrid(gx, gy, indexing="xy")
+    slabs = [jnp.column_stack([Xg.ravel(), Yg.ravel(), jnp.full(Xg.size, z0)]) for z0 in z_slices]
+    trg_grid = jnp.concatenate(slabs, axis=0)                       # (Ntrg, 3)
+    rr = jnp.linalg.norm(trg_grid - center, axis=1)
+    trg_in = trg_grid[rr < radius * 0.98]                           # strictly interior
+
+    sep_trg = separate_target(trg_in, S, 0.1)                       # (N,) bool, far/near
+    U_far = bio_offsurf_apply(trg_in, S, sh, sl_scal, dl_scal, True)
+    U_near = bio_offsurf_apply(trg_in, S, sh, sl_scal, dl_scal, False)
+    U = jnp.real(jnp.where(sep_trg[:, None], U_far, U_near))        # (N, 3) velocity
+
+    P = np.asarray(trg_in)
+    V = np.asarray(U)
+    nz = np.linalg.norm(V, axis=1) > 1e-30                          # drop zero-length arrows
+    P, V = P[nz], V[nz]
+    sx, sy, sz = (np.asarray(S["Xcart"][:, :, k]) for k in range(3))
+    ps = np.asarray(ptsrc)
+    fv = np.asarray(force, dtype=float)
+
+    def make_fig(with_sources):
+        fig = plt.figure(figsize=(8, 8))
+        ax = fig.add_subplot(111, projection="3d")
+        ax.plot_wireframe(sx, sy, sz, color="gray", alpha=0.4, linewidth=1.0)
+        ax.quiver(P[:, 0], P[:, 1], P[:, 2], V[:, 0], V[:, 1], V[:, 2],
+                  length=0.18, normalize=True, color="C0", linewidth=1.2)
+        if with_sources:
+            ax.quiver(ps[:, 0], ps[:, 1], ps[:, 2], fv[:, 0], fv[:, 1], fv[:, 2],
+                      color="red", linewidth=2.0, length=0.6, normalize=False)
+            lim = float(max(np.abs(ps).max(), radius)) * 1.15
+        else:
+            lim = radius * 1.1
+        ax.set(xlabel="x", ylabel="y", zlabel="z",
+               xlim=(-lim, lim), ylim=(-lim, lim), zlim=(-lim, lim),
+               title="Interior Stokes velocity field")
+        return fig
+
+    fig = make_fig(False)
+    fig.savefig("vis/Stk3d_interior_quiver_3d.png", dpi=150)
+    plt.close(fig)
+    fig = make_fig(True)
+    fig.savefig("vis/Stk3d_interior_quiver_sources_3d.png", dpi=150)
+    plt.close(fig)

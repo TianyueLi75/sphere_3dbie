@@ -53,9 +53,9 @@ def quadr_sphere(S: SphereDict, lmax: int) -> Tuple[SphereDict, shtns_jax.sht]:
     z = center[2] + radius * jnp.cos(theta_grid)
     S["Xcart"] = jnp.dstack([x,y,z])
 
-    xn = radius * jnp.sin(theta_grid) * jnp.cos(phi_grid)
-    yn = radius * jnp.sin(theta_grid) * jnp.sin(phi_grid)
-    zn = radius * jnp.cos(theta_grid)
+    xn = jnp.sin(theta_grid) * jnp.cos(phi_grid)
+    yn = jnp.sin(theta_grid) * jnp.sin(phi_grid)
+    zn = jnp.cos(theta_grid)
     S["Xncart"] = jnp.dstack([xn,yn,zn])
 
     S["Xsph"] = jnp.dstack([theta_grid, phi_grid])
@@ -80,4 +80,21 @@ def set_density(S: SphereDict, sig_x: jax.Array, sig_y: jax.Array = jnp.array([]
     
     return S
 
+def separate_target(trg: jax.Array, S: SphereDict, sep_eta: float) -> jax.Array:
+    """
+    Given a list of targets and min separation distance, 
+    return an array of booleans (0,1) 
+    whether each target is outside sep_eta and 
+    is therefore far from sphere S.
+    """
+    # reshape target to Ntrg x 3
+    if trg.shape[1] != 3:
+        if trg.shape[0] != 3:
+            raise Exception("target should be a Ntrg x 3 array.")
+        else:
+            trg = jnp.transpose(trg)
 
+    trg_dc = jnp.linalg.norm(trg - S["Xc"], axis=1) # per-target distance to sphere center
+    sep_vec = (trg_dc - S["r"]) > sep_eta # far if the surface gap exceeds sep_eta
+
+    return sep_vec
