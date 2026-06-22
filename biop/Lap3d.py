@@ -2,13 +2,13 @@
 Laplace Operator Class:
     SL and DL operators on a sphere, using spectra and solid harmonics
     TODO:
-        SH to point evaluation function needs to be jax-enabled, or vectorized
+        SH to point evaluation function needs to be jax-enabled
         Allow on-surface evaluation in bio_offsurf_apply()
         onsurf_diag_solve() l=0 currently set to BC values. Throw exception instead?
-        solid harmonics r should be scaled s.t. src sphere has r = 1
 
-    NOTE: (Jun 17, 2026)
-        added SL traction far eval and on-surface eval, for far and for Neumann BC formulation. No near formula for SL traction yet.
+    NOTE: 
+        (Jun 17, 2026) added SL traction far eval and on-surface eval, for far and for Neumann BC formulation. No near formula for SL traction yet.
+        (Jun 22, 2026) Vectorized SH_to_point_cplx
 """
 
 from typing import Dict, Any, Tuple
@@ -20,8 +20,6 @@ import numpy as np
 import lineax as lx
 import shtns
 import shtns_jax
-import matplotlib.pyplot as plt
-import mpld3
 
 import os
 import sys
@@ -596,14 +594,8 @@ if __name__ == "__main__":
     bc_check_direct = bio_onsurf_apply(sig_direct, sh, 0., 0., sgn, 1.0)
     resid_direct = jnp.linalg.norm(bc_check_direct - BC_flux)
     jax.debug.print("Residual of DIRECT solve: {a}", a=resid_direct)
-    # Accuracy
-    xtrg = Strg["Xcart"][:,:,0] 
-    ytrg = Strg["Xcart"][:,:,1]
-    ztrg = Strg["Xcart"][:,:,2]
-    trg_sphere2 = jnp.column_stack([jnp.reshape(xtrg,-1), jnp.reshape(ytrg,-1), jnp.reshape(ztrg,-1)])
-    true_pot = compute_potential(trg_sphere2, ptsrc, force)
-    true_pot = jnp.real(true_pot)
 
+    # Accuracy
     S = set_density(S, sig_direct)
     Ksig_direct = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, 1.0, 0.)
     Ksig_direct = jnp.real(jnp.reshape(Ksig_direct,(-1,1)))
@@ -656,57 +648,3 @@ if __name__ == "__main__":
 
     diff_direct = jnp.max(true_pot - Ksig_direct) / jnp.max(true_pot)
     jax.debug.print("Max relative error of order {lmax} solver at target radius {Rtrg} for direct solver is {d}", lmax=lmax, Rtrg=Rtrg, d=diff_direct)
-
-    # Visualization
-    z_slices = [-0.5, 0.0, 0.5]
-    Ng = 60
-    gx = jnp.linspace(-radius, radius, Ng)
-    gy = jnp.linspace(-radius, radius, Ng)
-    X, Y = jnp.meshgrid(gx, gy, indexing="xy")     # (Ng, Ng)
-
-    pot_slices = []
-    for z0 in z_slices:
-        Z = jnp.full_like(X, z0)
-        trg_grid = jnp.column_stack([X.ravel(), Y.ravel(), Z.ravel()])  # (Ntrg, 3)
-        sep_trg = separate_target(trg_grid, S, 0.1)                     # (Ntrg,) bool, far/near
-        Ksig_far = bio_offsurf_apply(trg_grid, S, sh, sl_scal, dl_scal, True)
-        Ksig_near = bio_offsurf_apply(trg_grid, S, sh, sl_scal, dl_scal, False)
-        Ksig_mix = jnp.where(sep_trg[:, None], Ksig_far, Ksig_near)     # (Ntrg, 1)
-        K = jnp.real(Ksig_mix).reshape(X.shape)
-        rr = jnp.sqrt(X**2 + Y**2 + z0**2)
-        K = jnp.where(rr < radius, K, jnp.nan)                          # mask outside sphere
-        pot_slices.append(np.asarray(K))
-
-    Xn, Yn = np.asarray(X), np.asarray(Y)
-    finite = np.concatenate([P[np.isfinite(P)] for P in pot_slices])
-    vmin, vmax = float(finite.min()), float(finite.max())
-
-    # 3D visual: each cross section as a filled contour at its own z offset.
-    fig = plt.figure(figsize=(8, 8))
-    ax = fig.add_subplot(111, projection="3d")
-    for z0, P in zip(z_slices, pot_slices):
-        ax.contourf(Xn, Yn, P, zdir="z", offset=z0, levels=40, vmin=vmin, vmax=vmax, cmap="viridis")
-    # source-sphere surface drawn from the actual quadrature grid S["Xcart"], bolder lines
-    sx = np.asarray(S["Xcart"][:, :, 0])
-    sy = np.asarray(S["Xcart"][:, :, 1])
-    sz = np.asarray(S["Xcart"][:, :, 2])
-    ax.plot_wireframe(sx, sy, sz, color="gray", alpha=0.5, linewidth=1.0)
-    ax.set(xlabel="x", ylabel="y", zlabel="z",
-           title="Interior Laplace layer potential -- cross sections")
-    sm = plt.cm.ScalarMappable(cmap="viridis", norm=plt.Normalize(vmin, vmax)); sm.set_array([])
-    fig.colorbar(sm, ax=ax, shrink=0.6, label="Re potential")
-    fig.savefig("vis/Lap3d_interior_slices_3d.png", dpi=150)
-    plt.close(fig)
-
-    # 2D companion: one contourf panel per slice, shared color scale.
-    fig2, axes = plt.subplots(1, len(z_slices), figsize=(4*len(z_slices), 4))
-    for axk, z0, P in zip(axes, z_slices, pot_slices):
-        cf = axk.contourf(Xn, Yn, P, levels=40, vmin=vmin, vmax=vmax, cmap="viridis")
-        rad_z = np.sqrt(max(radius**2 - z0**2, 0.0))
-        circ = plt.Circle((0, 0), rad_z, fill=False, color="k", linewidth=0.8)
-        axk.add_patch(circ)
-        axk.set(aspect="equal", xlabel="x", ylabel="y", title=f"z = {z0}")
-    sm2 = plt.cm.ScalarMappable(cmap="viridis", norm=plt.Normalize(vmin, vmax)); sm2.set_array([])
-    fig2.colorbar(sm2, ax=axes, shrink=0.8, label="Re potential")
-    fig2.savefig("vis/Lap3d_interior_slices_2d.png", dpi=150)
-    plt.close(fig2)

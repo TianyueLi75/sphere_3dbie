@@ -2,11 +2,10 @@
 Stokes Operator Class:
     SL and DL operators on a sphere, using spectra and solid harmonics
     TODO:
-        everything in numpy at the moment.
+        Made SHqst_to_point_cplx using np locally in this script -- need to incorporate into SHTns and have jax wrap
         Allow on-surface evaluation in bio_offsurf_apply()
         onsurf_diag_solve() l=0 currently set to BC values. Throw exception instead?
-        SL traction
-        solid harmonics r should be scaled s.t. src sphere has r = 1
+        SL traction near and far off-surface eval.
 """
 
 from typing import Dict, Any, Tuple
@@ -20,13 +19,11 @@ import jax.numpy as jnp
 import lineax as lx
 import shtns
 import shtns_jax
-import matplotlib.pyplot as plt
 
 import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-# from sphere_np import *
 from sphere import *
 
 SphereDict = Dict[str, Any]
@@ -373,11 +370,11 @@ def _stk_qst_to_points(qlm: jax.Array, slm: jax.Array, tlm: jax.Array, trg_theta
     slm = np.asarray(slm, dtype=np.complex128)
     tlm = np.asarray(tlm, dtype=np.complex128)
     cost = np.cos(np.asarray(trg_theta))
-    vals = []
-    for i in range(qlm.shape[0]):
+    def _helper(i):
         vr, vt, vp = sh.SHqst_to_point_cplx(qlm[i], slm[i], tlm[i], float(cost[i]), float(trg_phi[i]))
         vx, vy, vz = sph2cart(vr, vt, vp, trg_theta[i], trg_phi[i])
-        vals.append([vx, vy, vz])
+        return vx, vy, vz
+    vals = [_helper(trg_i) for trg_i in range(qlm.shape[0])]
     return jnp.array(vals, dtype=jnp.complex128)
 
 def Stk3d_sl(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
@@ -745,13 +742,13 @@ if __name__ == "__main__":
 
     # Targets -- interior
     print("\n Manufactured solutions test Stokes 3D solver on the unit sphere ---- Interior Dirichlet problem")
-    Rtrg = radius * 0.5
+    Rtrg = radius * 0.62
     sgn = -1.0
     Strg = build_sphere(center, Rtrg)
     Strg, shtrg = quadr_sphere(Strg, lmax)
 
-    ptsrc = jnp.array([[1.3,1.75,-2],[-1.3,-1.75,2]])
-    force = jnp.array([[1,1,1],[-1,-1,-1]]) # net force zero for interior flow
+    ptsrc = jnp.array([[1.3,1.75,-2],[-1.3,-1.,2.32]])
+    force = jnp.array([[1,-0.93,1.25],[-0.2,1.37,0]])
 
     x = S["Xcart"][:,:,0]
     y = S["Xcart"][:,:,1]
@@ -784,65 +781,14 @@ if __name__ == "__main__":
     diff_direct = jnp.max(true_field - Ksig_direct) / jnp.max(true_field)
     print("Max relative error of order {lmax} solver at target radius {Rtrg} for direct solver is {d}".format(lmax=lmax, Rtrg=Rtrg, d=diff_direct))
 
-    # Arbitrary-point spectral eval (bio_offsurf_apply) vs the grid _1sph path
-    #   for interior targets (exercises the interior solid-harmonic / V2W branch).
-    trg_grid = jnp.column_stack([
-        jnp.reshape(Strg["Xcart"][:, :, 0], -1),
-        jnp.reshape(Strg["Xcart"][:, :, 1], -1),
-        jnp.reshape(Strg["Xcart"][:, :, 2], -1),
-    ])
+    # Arbitrary-point spectral eval (bio_offsurf_apply) vs the grid _1sph to check far eval formulas
     K_1sph = jnp.real(jnp.reshape(bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal), (-1, 3)))
-    K_pt = jnp.real(bio_offsurf_apply(trg_grid, S, sh, sl_scal, dl_scal, far=False))
+    K_far = jnp.real(bio_offsurf_apply(trg_sphere2, S, sh, sl_scal, dl_scal, far=True))
+    err_far = jnp.max(jnp.abs(K_far - K_1sph)) / jnp.max(jnp.abs(K_1sph))
+    jax.debug.print("Max relative error of bio_offsurf_apply (far eval) vs bio_offsurf_apply_1sph at radius {Rtrg} = {e}", Rtrg=Rtrg, e=err_far)
+
+    #  ...  to check SHqst_to_point_cplx
+    K_pt = jnp.real(bio_offsurf_apply(trg_sphere2, S, sh, sl_scal, dl_scal, far=False))
     err_pt = jnp.max(jnp.abs(K_pt - K_1sph)) / jnp.max(jnp.abs(K_1sph))
     jax.debug.print("Max relative error of bio_offsurf_apply (point eval) vs bio_offsurf_apply_1sph at radius {Rtrg} = {e}", Rtrg=Rtrg, e=err_pt)
 
-
-    # Interior vector-field visualization of the Stokes velocity (quiver).
-    #   Same z-slice target grid as Lap3d, but coarse (quiver needs sparse arrows)
-    #   and combining the near/far evaluations via separate_target.
-    z_slices = [-0.5, 0.0, 0.5]
-    Ng = 10  # even so the grid excludes the polar axis x=y=0 (sin(theta)=0 singularity)
-    gx = jnp.linspace(-radius, radius, Ng)
-    gy = jnp.linspace(-radius, radius, Ng)
-    Xg, Yg = jnp.meshgrid(gx, gy, indexing="xy")
-    slabs = [jnp.column_stack([Xg.ravel(), Yg.ravel(), jnp.full(Xg.size, z0)]) for z0 in z_slices]
-    trg_grid = jnp.concatenate(slabs, axis=0)                       # (Ntrg, 3)
-    rr = jnp.linalg.norm(trg_grid - center, axis=1)
-    trg_in = trg_grid[rr < radius * 0.98]                           # strictly interior
-
-    sep_trg = separate_target(trg_in, S, 0.1)                       # (N,) bool, far/near
-    U_far = bio_offsurf_apply(trg_in, S, sh, sl_scal, dl_scal, True)
-    U_near = bio_offsurf_apply(trg_in, S, sh, sl_scal, dl_scal, False)
-    U = jnp.real(jnp.where(sep_trg[:, None], U_far, U_near))        # (N, 3) velocity
-
-    P = np.asarray(trg_in)
-    V = np.asarray(U)
-    nz = np.linalg.norm(V, axis=1) > 1e-30                          # drop zero-length arrows
-    P, V = P[nz], V[nz]
-    sx, sy, sz = (np.asarray(S["Xcart"][:, :, k]) for k in range(3))
-    ps = np.asarray(ptsrc)
-    fv = np.asarray(force, dtype=float)
-
-    def make_fig(with_sources):
-        fig = plt.figure(figsize=(8, 8))
-        ax = fig.add_subplot(111, projection="3d")
-        ax.plot_wireframe(sx, sy, sz, color="gray", alpha=0.4, linewidth=1.0)
-        ax.quiver(P[:, 0], P[:, 1], P[:, 2], V[:, 0], V[:, 1], V[:, 2],
-                  length=0.18, normalize=True, color="C0", linewidth=1.2)
-        if with_sources:
-            ax.quiver(ps[:, 0], ps[:, 1], ps[:, 2], fv[:, 0], fv[:, 1], fv[:, 2],
-                      color="red", linewidth=2.0, length=0.6, normalize=False)
-            lim = float(max(np.abs(ps).max(), radius)) * 1.15
-        else:
-            lim = radius * 1.1
-        ax.set(xlabel="x", ylabel="y", zlabel="z",
-               xlim=(-lim, lim), ylim=(-lim, lim), zlim=(-lim, lim),
-               title="Interior Stokes velocity field")
-        return fig
-
-    fig = make_fig(False)
-    fig.savefig("vis/Stk3d_interior_quiver_3d.png", dpi=150)
-    plt.close(fig)
-    fig = make_fig(True)
-    fig.savefig("vis/Stk3d_interior_quiver_sources_3d.png", dpi=150)
-    plt.close(fig)
