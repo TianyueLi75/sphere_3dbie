@@ -110,7 +110,7 @@ def Lap3d_dsl_far(trg: jax.Array, trgN: jax.Array, S:SphereDict, sh: shtns_jax.s
         away from the surface).
     Returns the traction at the targets: Ntrg x 1.
 
-    The SL traction kernel is (1/4pi) (x-y).n_x / |x-y|^3.
+    The SL traction kernel is -(1/4pi) (x-y).n_x / |x-y|^3.
     With r = trg - src = x - y
     """
     assert trg.shape[1] == 3 and trgN.shape[1] == 3
@@ -124,7 +124,7 @@ def Lap3d_dsl_far(trg: jax.Array, trgN: jax.Array, S:SphereDict, sh: shtns_jax.s
     d = jnp.linalg.norm(r, axis=2)          # Ntrg x Nsrc
     invd3 = 1.0 / (d * d * d)
     rdotn = jnp.sum(r * trgN[None, :, :], axis=2)  # Ntrg x Nsrc
-    prefac = 1.0 / 4.0 / jnp.pi
+    prefac = - 1.0 / 4.0 / jnp.pi
     T_sigma = prefac * jnp.sum(invd3 * rdotn * (wts * fsrc)[None, :], axis=1)
     return T_sigma[:, None]
 
