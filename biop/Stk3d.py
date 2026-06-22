@@ -234,27 +234,29 @@ def Stk3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: s
     vlm_sigma, wlm_sigma, xlm_sigma = sig_xyz2vwx(Sigma_x, Sigma_y, Sigma_z, theta, phi, sh)
     
     trg_dr = Strg["r"]
-    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64) 
-    diag_V, diag_W, diag_X = Stk3d_sl_VWX_diag(sh) 
-    rpowers_V_ext = trg_dr ** (-l_vals-2.0) 
-    rpowers_V_int = trg_dr ** (l_vals+1.0) 
-    vlm_SL_sigma_ext = rpowers_V_ext * diag_V * vlm_sigma 
+    a = S["r"]
+    rho = trg_dr / a          # solid harmonics evaluated as if src sphere were unit
+    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
+    diag_V, diag_W, diag_X = Stk3d_sl_VWX_diag(sh)
+    rpowers_V_ext = rho ** (-l_vals-2.0)
+    rpowers_V_int = rho ** (l_vals+1.0)
+    vlm_SL_sigma_ext = rpowers_V_ext * diag_V * vlm_sigma
     vlm_SL_sigma_int = rpowers_V_int * diag_V * vlm_sigma
 
-    rpowers_W_ext = trg_dr ** (-l_vals)
-    rpowers_W_int = trg_dr ** (l_vals - 1.0)
-    wlm_SL_sigma_ext = rpowers_W_ext * diag_W * wlm_sigma 
-    wlm_SL_sigma_int = rpowers_W_int * diag_W * wlm_sigma 
+    rpowers_W_ext = rho ** (-l_vals)
+    rpowers_W_int = rho ** (l_vals - 1.0)
+    wlm_SL_sigma_ext = rpowers_W_ext * diag_W * wlm_sigma
+    wlm_SL_sigma_int = rpowers_W_int * diag_W * wlm_sigma
 
-    rpowers_X_ext = trg_dr ** (-l_vals - 1.0)
-    rpowers_X_int = trg_dr ** (l_vals)
+    rpowers_X_ext = rho ** (-l_vals - 1.0)
+    rpowers_X_int = rho ** (l_vals)
     xlm_SL_sigma_ext = rpowers_X_ext * diag_X * xlm_sigma
     xlm_SL_sigma_int = rpowers_X_int * diag_X * xlm_sigma
 
-    diag_V2W_int = (l_vals+1.0) / (4.0*l_vals+2.0) 
-    diag_W2V_ext = l_vals / (4.0*l_vals+2.0) 
-    rpowers_V2W_int = trg_dr ** (l_vals+1.0) - trg_dr ** (l_vals - 1.0) # Note: TYPO IN PAPER
-    rpowers_W2V_ext = trg_dr ** (-l_vals - 2.0) - trg_dr ** (-l_vals)
+    diag_V2W_int = (l_vals+1.0) / (4.0*l_vals+2.0)
+    diag_W2V_ext = l_vals / (4.0*l_vals+2.0)
+    rpowers_V2W_int = rho ** (l_vals+1.0) - rho ** (l_vals - 1.0) # Note: TYPO IN PAPER
+    rpowers_W2V_ext = rho ** (-l_vals - 2.0) - rho ** (-l_vals)
     V2Wlm_SL_sigma_int = rpowers_V2W_int * diag_V2W_int * vlm_sigma
     W2Vlm_SL_sigma_ext = rpowers_W2V_ext * diag_W2V_ext * wlm_sigma
 
@@ -276,7 +278,7 @@ def Stk3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: s
         wlm_SL_sigma = wlm_SL_sigma[:nlm_trg]
         xlm_SL_sigma = xlm_SL_sigma[:nlm_trg]
     val_x, val_y, val_z = sig_vwx2xyz(vlm_SL_sigma, wlm_SL_sigma, xlm_SL_sigma, theta_trg, phi_trg, shtrg)
-    SL_sigma = jnp.stack([val_x, val_y, val_z], axis=2)
+    SL_sigma = a * jnp.stack([val_x, val_y, val_z], axis=2)   # SL scales by a
 
     return SL_sigma
 
@@ -302,28 +304,30 @@ def Stk3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: s
     vlm_sigma, wlm_sigma, xlm_sigma = sig_xyz2vwx(Sigma_x, Sigma_y, Sigma_z, theta, phi, sh)
 
     trg_dr = Strg["r"]
-    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64) 
+    a = S["r"]
+    rho = trg_dr / a          # solid harmonics evaluated as if src sphere were unit
+    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
     diag_V_ext, diag_W_ext, diag_X_ext, diag_V_int, diag_W_int, diag_X_int = Stk3d_dl_VWX_diag(sh)
-    
-    rpowers_V_ext = trg_dr ** (- l_vals - 2.0) 
-    rpowers_V_int = trg_dr ** (l_vals + 1.0) 
-    vlm_DL_sigma_ext = rpowers_V_ext * diag_V_ext * vlm_sigma 
+
+    rpowers_V_ext = rho ** (- l_vals - 2.0)
+    rpowers_V_int = rho ** (l_vals + 1.0)
+    vlm_DL_sigma_ext = rpowers_V_ext * diag_V_ext * vlm_sigma
     vlm_DL_sigma_int = rpowers_V_int * diag_V_int * vlm_sigma
 
-    rpowers_W_ext = trg_dr ** (-l_vals)
-    rpowers_W_int = trg_dr ** (l_vals - 1.0)
+    rpowers_W_ext = rho ** (-l_vals)
+    rpowers_W_int = rho ** (l_vals - 1.0)
     wlm_DL_sigma_ext = rpowers_W_ext * diag_W_ext * wlm_sigma
-    wlm_DL_sigma_int = rpowers_W_int * diag_W_int * wlm_sigma 
+    wlm_DL_sigma_int = rpowers_W_int * diag_W_int * wlm_sigma
 
-    rpowers_X_ext = trg_dr ** (-l_vals - 1.0)
-    rpowers_X_int = trg_dr ** (l_vals)
+    rpowers_X_ext = rho ** (-l_vals - 1.0)
+    rpowers_X_int = rho ** (l_vals)
     xlm_DL_sigma_ext = rpowers_X_ext * diag_X_ext * xlm_sigma
     xlm_DL_sigma_int = rpowers_X_int * diag_X_int * xlm_sigma
 
-    diag_V2W_int = (l_vals+1.0) * (l_vals + 2.0) / (2.0*l_vals+1.0) 
+    diag_V2W_int = (l_vals+1.0) * (l_vals + 2.0) / (2.0*l_vals+1.0)
     diag_W2V_ext = 2. * l_vals * (l_vals - 1.0) / (4.0*l_vals+2.0)
-    rpowers_V2W_int = - trg_dr ** (l_vals + 1.0) + trg_dr ** (l_vals - 1.0)
-    rpowers_W2V_ext = trg_dr ** (-l_vals - 2.0) - trg_dr ** (-l_vals) 
+    rpowers_V2W_int = - rho ** (l_vals + 1.0) + rho ** (l_vals - 1.0)
+    rpowers_W2V_ext = rho ** (-l_vals - 2.0) - rho ** (-l_vals)
     V2Wlm_DL_sigma_int = rpowers_V2W_int * diag_V2W_int * vlm_sigma
     W2Vlm_DL_sigma_ext = rpowers_W2V_ext * diag_W2V_ext * wlm_sigma
 
@@ -394,28 +398,39 @@ def Stk3d_sl(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
 
     trg_dr, trg_theta, trg_phi = _stk_trg_sph(trg, S)
     trg_dr = trg_dr[:,None]   # Ntrg x 1, broadcasts against (nlm,)
+    a = S['r']
+    rho = trg_dr / a          # solid harmonics evaluated as if src sphere were unit
     l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
     diag_V, diag_W, diag_X = Stk3d_sl_VWX_diag(sh)
+    rpowers_V_ext = rho ** (-l_vals-2.0)
+    rpowers_V_int = rho ** (l_vals+1.0)
+    vlm_SL_sigma_ext = rpowers_V_ext * diag_V * vlm_sigma
+    vlm_SL_sigma_int = rpowers_V_int * diag_V * vlm_sigma
 
-    vlm_ext = trg_dr ** (-l_vals-2.0) * diag_V * vlm_sigma
-    vlm_int = trg_dr ** (l_vals+1.0) * diag_V * vlm_sigma
-    wlm_ext = trg_dr ** (-l_vals) * diag_W * wlm_sigma
-    wlm_int = trg_dr ** (l_vals-1.0) * diag_W * wlm_sigma
-    xlm_ext = trg_dr ** (-l_vals-1.0) * diag_X * xlm_sigma
-    xlm_int = trg_dr ** (l_vals) * diag_X * xlm_sigma
+    rpowers_W_ext = rho ** (-l_vals)
+    rpowers_W_int = rho ** (l_vals - 1.0)
+    wlm_SL_sigma_ext = rpowers_W_ext * diag_W * wlm_sigma
+    wlm_SL_sigma_int = rpowers_W_int * diag_W * wlm_sigma
+
+    rpowers_X_ext = rho ** (-l_vals - 1.0)
+    rpowers_X_int = rho ** (l_vals)
+    xlm_SL_sigma_ext = rpowers_X_ext * diag_X * xlm_sigma
+    xlm_SL_sigma_int = rpowers_X_int * diag_X * xlm_sigma
 
     diag_V2W_int = (l_vals+1.0) / (4.0*l_vals+2.0)
     diag_W2V_ext = l_vals / (4.0*l_vals+2.0)
-    V2Wlm_int = (trg_dr ** (l_vals+1.0) - trg_dr ** (l_vals-1.0)) * diag_V2W_int * vlm_sigma
-    W2Vlm_ext = (trg_dr ** (-l_vals-2.0) - trg_dr ** (-l_vals)) * diag_W2V_ext * wlm_sigma
+    rpowers_V2W_int = rho ** (l_vals+1.0) - rho ** (l_vals - 1.0) # Note: TYPO IN PAPER
+    rpowers_W2V_ext = rho ** (-l_vals - 2.0) - rho ** (-l_vals)
+    V2Wlm_SL_sigma_int = rpowers_V2W_int * diag_V2W_int * vlm_sigma
+    W2Vlm_SL_sigma_ext = rpowers_W2V_ext * diag_W2V_ext * wlm_sigma
 
-    is_ext = trg_dr > S['r']
-    vlm = jnp.where(is_ext, vlm_ext + W2Vlm_ext, vlm_int)
-    wlm = jnp.where(is_ext, wlm_ext, wlm_int + V2Wlm_int)
-    xlm = jnp.where(is_ext, xlm_ext, xlm_int)
+    is_ext = trg_dr > a
+    vlm_SL_sigma = jnp.where(is_ext, vlm_SL_sigma_ext + W2Vlm_SL_sigma_ext, vlm_SL_sigma_int)
+    wlm_SL_sigma = jnp.where(is_ext, wlm_SL_sigma_ext, wlm_SL_sigma_int + V2Wlm_SL_sigma_int)
+    xlm_SL_sigma = jnp.where(is_ext, xlm_SL_sigma_ext, xlm_SL_sigma_int)
 
-    qlm, slm, tlm = vwx2qst(vlm, wlm, xlm, sh)
-    return _stk_qst_to_points(qlm, slm, tlm, trg_theta, trg_phi, sh)
+    qlm, slm, tlm = vwx2qst(vlm_SL_sigma, wlm_SL_sigma, xlm_SL_sigma, sh)
+    return a * _stk_qst_to_points(qlm, slm, tlm, trg_theta, trg_phi, sh)   # SL scales by a
 
 def Stk3d_dl(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
@@ -435,27 +450,39 @@ def Stk3d_dl(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
 
     trg_dr, trg_theta, trg_phi = _stk_trg_sph(trg, S)
     trg_dr = trg_dr[:,None]
+    a = S['r']
+    rho = trg_dr / a          # solid harmonics evaluated as if src sphere were unit
     l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
     diag_V_ext, diag_W_ext, diag_X_ext, diag_V_int, diag_W_int, diag_X_int = Stk3d_dl_VWX_diag(sh)
 
-    vlm_ext = trg_dr ** (-l_vals-2.0) * diag_V_ext * vlm_sigma
-    vlm_int = trg_dr ** (l_vals+1.0) * diag_V_int * vlm_sigma
-    wlm_ext = trg_dr ** (-l_vals) * diag_W_ext * wlm_sigma
-    wlm_int = trg_dr ** (l_vals-1.0) * diag_W_int * wlm_sigma
-    xlm_ext = trg_dr ** (-l_vals-1.0) * diag_X_ext * xlm_sigma
-    xlm_int = trg_dr ** (l_vals) * diag_X_int * xlm_sigma
+    rpowers_V_ext = rho ** (- l_vals - 2.0)
+    rpowers_V_int = rho ** (l_vals + 1.0)
+    vlm_DL_sigma_ext = rpowers_V_ext * diag_V_ext * vlm_sigma
+    vlm_DL_sigma_int = rpowers_V_int * diag_V_int * vlm_sigma
 
-    diag_V2W_int = (l_vals+1.0) * (l_vals+2.0) / (2.0*l_vals+1.0)
-    diag_W2V_ext = 2. * l_vals * (l_vals-1.0) / (4.0*l_vals+2.0)
-    V2Wlm_int = (-trg_dr ** (l_vals+1.0) + trg_dr ** (l_vals-1.0)) * diag_V2W_int * vlm_sigma
-    W2Vlm_ext = (trg_dr ** (-l_vals-2.0) - trg_dr ** (-l_vals)) * diag_W2V_ext * wlm_sigma
+    rpowers_W_ext = rho ** (-l_vals)
+    rpowers_W_int = rho ** (l_vals - 1.0)
+    wlm_DL_sigma_ext = rpowers_W_ext * diag_W_ext * wlm_sigma
+    wlm_DL_sigma_int = rpowers_W_int * diag_W_int * wlm_sigma
 
-    is_ext = trg_dr > S['r']
-    vlm = jnp.where(is_ext, vlm_ext + W2Vlm_ext, vlm_int)
-    wlm = jnp.where(is_ext, wlm_ext, wlm_int + V2Wlm_int)
-    xlm = jnp.where(is_ext, xlm_ext, xlm_int)
+    rpowers_X_ext = rho ** (-l_vals - 1.0)
+    rpowers_X_int = rho ** (l_vals)
+    xlm_DL_sigma_ext = rpowers_X_ext * diag_X_ext * xlm_sigma
+    xlm_DL_sigma_int = rpowers_X_int * diag_X_int * xlm_sigma
 
-    qlm, slm, tlm = vwx2qst(vlm, wlm, xlm, sh)
+    diag_V2W_int = (l_vals+1.0) * (l_vals + 2.0) / (2.0*l_vals+1.0)
+    diag_W2V_ext = 2. * l_vals * (l_vals - 1.0) / (4.0*l_vals+2.0)
+    rpowers_V2W_int = - rho ** (l_vals + 1.0) + rho ** (l_vals - 1.0)
+    rpowers_W2V_ext = rho ** (-l_vals - 2.0) - rho ** (-l_vals)
+    V2Wlm_DL_sigma_int = rpowers_V2W_int * diag_V2W_int * vlm_sigma
+    W2Vlm_DL_sigma_ext = rpowers_W2V_ext * diag_W2V_ext * wlm_sigma
+
+    is_ext = trg_dr > a
+    vlm_DL_sigma = jnp.where(is_ext, vlm_DL_sigma_ext + W2Vlm_DL_sigma_ext, vlm_DL_sigma_int)
+    wlm_DL_sigma = jnp.where(is_ext, wlm_DL_sigma_ext, wlm_DL_sigma_int + V2Wlm_DL_sigma_int)
+    xlm_DL_sigma = jnp.where(is_ext, xlm_DL_sigma_ext, xlm_DL_sigma_int)
+
+    qlm, slm, tlm = vwx2qst(vlm_DL_sigma, wlm_DL_sigma, xlm_DL_sigma, sh)
     return _stk_qst_to_points(qlm, slm, tlm, trg_theta, trg_phi, sh)
 
 def bio_offsurf_apply(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, far: bool = False) -> jax.Array:
@@ -471,12 +498,13 @@ def bio_offsurf_apply(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht, sl_scal:
     Ksigma = sl_scal * SLsigma + dl_scal * DLsigma
     return Ksigma
 
-def bio_onsurf_apply(sigma_tens: jax.Array, theta: jax.Array, phi: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0.) -> jax.Array:
+def bio_onsurf_apply(sigma_tens: jax.Array, theta: jax.Array, phi: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0., radius: float = 1.0) -> jax.Array:
     """
     Apply the combined DL potential operator K = sl_scal * SL + dl_scal * DL
         to the density <sigma_tens> defined on the <sh> grid
         taking into account the DL jump condition with sign <sgn>.
     Returns the resulting function, also defined on the <sh> grid.
+    The SL block scales by the source-sphere <radius> (DL/dSL/jump are scale-invariant).
     """
 
     sigma_x = sigma_tens[:,:,0]
@@ -485,9 +513,9 @@ def bio_onsurf_apply(sigma_tens: jax.Array, theta: jax.Array, phi: jax.Array, sh
     vlm, wlm, xlm = sig_xyz2vwx(sigma_x, sigma_y, sigma_z, theta, phi, sh)
 
     diag_V, diag_W, diag_X = Stk3d_sl_VWX_diag(sh)
-    vlm_SL_sigma = diag_V * vlm
-    wlm_SL_sigma = diag_W * wlm
-    xlm_SL_sigma = diag_X * xlm
+    vlm_SL_sigma = radius * diag_V * vlm
+    wlm_SL_sigma = radius * diag_W * wlm
+    xlm_SL_sigma = radius * diag_X * xlm
     
     diag_V_ext, diag_W_ext, diag_X_ext, diag_V_int, diag_W_int, diag_X_int = Stk3d_dl_VWX_diag(sh)
     vlm_DL_sigma = 0.5*(diag_V_int + diag_V_ext) * vlm
@@ -511,9 +539,10 @@ def bio_onsurf_apply(sigma_tens: jax.Array, theta: jax.Array, phi: jax.Array, sh
 
     return V
 
-def stokes_onsurf_direct_solve(bc_vec: jax.Array, theta: jax.Array, phi: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0.) -> jax.Array:
+def stokes_onsurf_direct_solve(bc_vec: jax.Array, theta: jax.Array, phi: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0., radius: float = 1.0) -> jax.Array:
     """
     Directly solves the Stokes BIO equation using the VWX diagonal property.
+    The SL block scales by the source-sphere <radius> (DL/dSL/jump are scale-invariant).
     """
 
     vlm_bc, wlm_bc, xlm_bc = sig_xyz2vwx(bc_vec[:,:,0], bc_vec[:,:,1], bc_vec[:,:,2], theta, phi, sh)
@@ -527,9 +556,9 @@ def stokes_onsurf_direct_solve(bc_vec: jax.Array, theta: jax.Array, phi: jax.Arr
     diag_W_dsl = 0.5 * (diag_W_int + diag_W_ext)
     diag_X_dsl = 0.5 * (diag_X_int + diag_X_ext)
     
-    op_diag_V = (0.5 * dl_scal * sgn) + (dl_scal * diag_V_dl) + (sl_scal * diag_V_sl) + (0.5 * dsl_scal * (-1*sgn)) + (dsl_scal * diag_V_dsl)
-    op_diag_W = (0.5 * dl_scal * sgn) + (dl_scal * diag_W_dl) + (sl_scal * diag_W_sl) + (0.5 * dsl_scal * (-1*sgn)) + (dsl_scal * diag_W_dsl)
-    op_diag_X = (0.5 * dl_scal * sgn) + (dl_scal * diag_X_dl) + (sl_scal * diag_X_sl) + (0.5 * dsl_scal * (-1*sgn)) + (dsl_scal * diag_X_dsl)
+    op_diag_V = (0.5 * dl_scal * sgn) + (dl_scal * diag_V_dl) + (radius * sl_scal * diag_V_sl) + (0.5 * dsl_scal * (-1*sgn)) + (dsl_scal * diag_V_dsl)
+    op_diag_W = (0.5 * dl_scal * sgn) + (dl_scal * diag_W_dl) + (radius * sl_scal * diag_W_sl) + (0.5 * dsl_scal * (-1*sgn)) + (dsl_scal * diag_W_dsl)
+    op_diag_X = (0.5 * dl_scal * sgn) + (dl_scal * diag_X_dl) + (radius * sl_scal * diag_X_sl) + (0.5 * dsl_scal * (-1*sgn)) + (dsl_scal * diag_X_dsl)
 
     eps = 1e-14
     def safe_div(bc_lm, op_diag):

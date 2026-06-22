@@ -153,14 +153,16 @@ def Lap3d_sl(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     trg_theta = jnp.acos(trg_dz / trg_dr)
     trg_dr = trg_dr[:,None] 
 
-    # Solid harmonics
-    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64) 
+    # Solid harmonics (evaluated as if src sphere were unit; SL scales by a = S['r'])
+    a = S['r']
+    rho = trg_dr / a
+    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
     diag = Lap3d_sl_diag(sh)
-    rpowers_ext = trg_dr ** (-l_vals-1) 
-    rpowers_int = trg_dr ** (l_vals) 
+    rpowers_ext = rho ** (-l_vals-1)
+    rpowers_int = rho ** (l_vals)
     qlm_SL_sigma_ext = rpowers_ext * qlm_sigma * diag
-    qlm_SL_sigma_int = rpowers_int * qlm_sigma * diag 
-    qlm_SL_sigma = jnp.where(trg_dr > S['r'], qlm_SL_sigma_ext, qlm_SL_sigma_int)
+    qlm_SL_sigma_int = rpowers_int * qlm_sigma * diag
+    qlm_SL_sigma = a * jnp.where(trg_dr > a, qlm_SL_sigma_ext, qlm_SL_sigma_int)
 
     # Evaluation at target
     qlm_SL_sigma = np.array(qlm_SL_sigma, dtype=np.complex128)
@@ -201,14 +203,16 @@ def Lap3d_dl(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     trg_theta = jnp.acos(trg_dz / trg_dr)
     trg_dr = trg_dr[:,None] 
 
-    # Solid harmonics
+    # Solid harmonics (evaluated as if src sphere were unit; DL is scale-invariant)
+    a = S['r']
+    rho = trg_dr / a
     l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
     [diag_ext, diag_int] = Lap3d_dl_diag(sh)
-    rpowers_ext = trg_dr ** (-l_vals-1) 
-    rpowers_int = trg_dr ** (l_vals) 
+    rpowers_ext = rho ** (-l_vals-1)
+    rpowers_int = rho ** (l_vals)
     qlm_DL_sigma_ext = rpowers_ext * qlm_sigma * diag_ext
     qlm_DL_sigma_int = rpowers_int * qlm_sigma * diag_int
-    qlm_DL_sigma = jnp.where(trg_dr > S['r'], qlm_DL_sigma_ext, qlm_DL_sigma_int)
+    qlm_DL_sigma = jnp.where(trg_dr > a, qlm_DL_sigma_ext, qlm_DL_sigma_int)
     
     # Evaluation at target
     qlm_DL_sigma = np.array(qlm_DL_sigma, dtype=np.complex128)
@@ -247,14 +251,16 @@ def Lap3d_dsl(trg: jax.Array, trgN: jax.Array, S: SphereDict, sh: shtns_jax.sht)
     trg_theta = jnp.acos(trg_dz / trg_dr)
     trg_dr = trg_dr[:,None] 
 
-    # Solid harmonics
+    # Solid harmonics (evaluated as if src sphere were unit; SL traction is scale-invariant)
+    a = S['r']
+    rho = trg_dr / a
     l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
     [diag_ext, diag_int] = Lap3d_dsl_diag(sh)
-    rpowers_ext = trg_dr ** (-l_vals-1) 
-    rpowers_int = trg_dr ** (l_vals) 
+    rpowers_ext = rho ** (-l_vals-1)
+    rpowers_int = rho ** (l_vals)
     qlm_T_sigma_ext = rpowers_ext * qlm_sigma * diag_ext
     qlm_T_sigma_int = rpowers_int * qlm_sigma * diag_int
-    qlm_T_sigma = jnp.where(trg_dr > S['r'], qlm_T_sigma_ext, qlm_T_sigma_int)
+    qlm_T_sigma = jnp.where(trg_dr > a, qlm_T_sigma_ext, qlm_T_sigma_int)
     
     # Evaluation at target
     qlm_T_sigma = np.array(qlm_T_sigma, dtype=np.complex128)
@@ -286,13 +292,15 @@ def Lap3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: s
     qlm_sigma = sh.analys_cplx_jax(Sigma)
 
     trg_dr = Strg["r"]
-    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64) 
+    a = S['r']
+    rho = trg_dr / a          # solid harmonics as if src sphere were unit; SL scales by a
+    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
     diag = Lap3d_sl_diag(sh)
-    rpowers_ext = trg_dr ** (-l_vals-1) 
-    rpowers_int = trg_dr ** (l_vals) 
-    qlm_SL_sigma_ext = rpowers_ext * qlm_sigma * diag
-    qlm_SL_sigma_int = rpowers_int * qlm_sigma * diag
-    qlm_SL_sigma = qlm_SL_sigma_ext if trg_dr > S['r'] else qlm_SL_sigma_int
+    rpowers_ext = rho ** (-l_vals-1)
+    rpowers_int = rho ** (l_vals)
+    qlm_SL_sigma_ext = a * rpowers_ext * qlm_sigma * diag
+    qlm_SL_sigma_int = a * rpowers_int * qlm_sigma * diag
+    qlm_SL_sigma = qlm_SL_sigma_ext if trg_dr > a else qlm_SL_sigma_int
 
     # Interpolate to new grid by padding or truncating coefficients to Strg['lmax']
     nlm_src = sh.nlm_cplx
@@ -326,13 +334,15 @@ def Lap3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: s
     qlm_sigma = sh.analys_cplx_jax(Sigma)
 
     trg_dr = Strg["r"]
+    a = S['r']
+    rho = trg_dr / a          # solid harmonics as if src sphere were unit; DL is scale-invariant
     l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
     [diag_ext, diag_int] = Lap3d_dl_diag(sh)
-    rpowers_ext = trg_dr ** (-l_vals-1) 
-    rpowers_int = trg_dr ** (l_vals) 
+    rpowers_ext = rho ** (-l_vals-1)
+    rpowers_int = rho ** (l_vals)
     qlm_DL_sigma_ext = rpowers_ext * qlm_sigma * diag_ext
     qlm_DL_sigma_int = rpowers_int * qlm_sigma * diag_int
-    qlm_DL_sigma = qlm_DL_sigma_ext if trg_dr > S['r'] else qlm_DL_sigma_int
+    qlm_DL_sigma = qlm_DL_sigma_ext if trg_dr > a else qlm_DL_sigma_int
 
     # Interpolate to new grid by padding or truncating coefficients to Strg['lmax']
     nlm_src = sh.nlm_cplx
@@ -412,16 +422,17 @@ def compute_flux(trg: jax.Array, trgN: jax.Array, src: jax.Array, force: jax.Arr
     return K
 
 @partial(jax.jit, static_argnames=["sh"])
-def bio_diag_apply(qlm_sigma: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, dsl_scal: float = 0.) -> jax.Array:
+def bio_diag_apply(qlm_sigma: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, dsl_scal: float = 0., radius: float = 1.0) -> jax.Array:
     """
     Apply the combined DL potential operator K = sl_scal * SL + dl_scal * DL
-        to the density with coefficients <qlm_sigma> in SH basis 
+        to the density with coefficients <qlm_sigma> in SH basis
     Returns the resulting function coefficients <qlm_KL_sigma> in SH basis,
         where DL is evaluated in the P.V. sense.
     Added dSL, the traction kernel for singular layer potential. Formulation should be either a combination of SL+DL, or T, not both.
+    The SL block scales by the source-sphere <radius> (DL/dSL are scale-invariant).
     """
 
-    sl_diag = Lap3d_sl_diag(sh)
+    sl_diag = radius * Lap3d_sl_diag(sh)
     [dl_diag_ext, dl_diag_int] = Lap3d_dl_diag(sh)
     dl_diag = 0.5*(dl_diag_ext + dl_diag_int)
     [dsl_diag_ext, dsl_diag_int] = Lap3d_dsl_diag(sh)
@@ -433,32 +444,34 @@ def bio_diag_apply(qlm_sigma: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_s
     return qlm_KL_sigma
 
 @partial(jax.jit, static_argnames=["sh"])
-def bio_onsurf_apply(sigma: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0.) -> jax.Array:
+def bio_onsurf_apply(sigma: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0., radius: float = 1.0) -> jax.Array:
     """
     Apply the combined DL potential operator K = sl_scal * SL + dl_scal * DL
         to the density <sigma> defined on the <sh> grid
         taking into account the DL jump condition with sign <sgn>.
     Traction kernel should have opposite sign to DL, but only one should appear per formulation.
+    The SL block scales by the source-sphere <radius> (DL/dSL/jump are scale-invariant).
     """
     # assert dl_scal * dsl_scal == 0 # check that only one is nonzero. -- ran into jit compile problem
 
     qlm_sigma = sh.analys_cplx_jax(sigma)
-    qlm_KL_sigma = bio_diag_apply(qlm_sigma, sh, sl_scal, dl_scal, dsl_scal)
+    qlm_KL_sigma = bio_diag_apply(qlm_sigma, sh, sl_scal, dl_scal, dsl_scal, radius)
     KL_sigma = sh.synth_cplx_jax(qlm_KL_sigma)
     return 0.5 * dl_scal * sgn * sigma + 0.5 * dsl_scal * (-1*sgn) * sigma + KL_sigma
 
 @partial(jax.jit, static_argnames=["sh"])
-def bio_onsurf_direct_solve(bc_pot: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0.) -> jax.Array:
+def bio_onsurf_direct_solve(bc_pot: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0., radius: float = 1.0) -> jax.Array:
     """
     Directly solves the BIO equation in the spectral domain.
     Equation: [0.5 * dl_scal * sgn * I + KL] sigma = bc_pot
-    
+
     Note: The l=0 mode is in the null space and is set to the BC value.
+    The SL block scales by the source-sphere <radius> (DL/dSL/jump are scale-invariant).
     """
     # assert dl_scal * dsl_scal == 0
 
     qlm_bc = sh.analys_cplx_jax(bc_pot)
-    sl_diag = Lap3d_sl_diag(sh)
+    sl_diag = radius * Lap3d_sl_diag(sh)
     [dl_diag_ext, dl_diag_int] = Lap3d_dl_diag(sh)
     dl_diag = 0.5 * (dl_diag_ext + dl_diag_int)
     [dsl_diag_ext, dsl_diag_int] = Lap3d_dsl_diag(sh)
