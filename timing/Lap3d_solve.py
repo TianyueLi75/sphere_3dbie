@@ -120,34 +120,45 @@ def test(lmax: int):
     time_eval = tend - tstart
     Ksig_direct = jnp.real(jnp.reshape(Ksig_direct,(-1,1)))
 
-    diff_gmres = jnp.max(true_pot - Ksig_gmres) / jnp.max(true_pot)
-    diff_direct = jnp.max(true_pot - Ksig_direct) / jnp.max(true_pot)
-    jax.debug.print("Max relative error of order {lmax} solver at target radius {Rtrg} for GMRES solver is {d1}, for direct solver is {d2}", lmax=lmax, Rtrg=Rtrg, d1=diff_gmres, d2=diff_direct)
+    err_gmres = jnp.max(jnp.abs(true_pot - Ksig_gmres)) / jnp.max(jnp.abs(true_pot))
+    err_direct = jnp.max(jnp.abs(true_pot - Ksig_direct)) / jnp.max(jnp.abs(true_pot))
+    jax.debug.print("Max relative error of order {lmax} solver at target radius {Rtrg} for GMRES solver is {d1}, for direct solver is {d2}", lmax=lmax, Rtrg=Rtrg, d1=err_gmres, d2=err_direct)
 
-    return time_gmres, time_direct, time_eval
+    return time_gmres, time_direct, time_eval, float(err_gmres), float(err_direct)
 
 if __name__ == "__main__":
-    # pmin = 4
-    # pmax = 1000
-    # pstep = 50
-    pmin = 4
-    pmax = 100
-    pstep = 25
-    lmax_list = jnp.arange(pmin, pmax, pstep, dtype = int)
+    here = os.path.dirname(os.path.abspath(__file__))
+    lmax_list = list(range(4, 101, 8))   # manufactured-solution sweep, lmax in [4, 100]
     Np = len(lmax_list)
     Tsolve = np.zeros((Np,))
     Tsolve_diag = np.zeros((Np,))
     Teval = np.zeros((Np,))
+    Egmres = np.zeros((Np,))
+    Edirect = np.zeros((Np,))
+    print(f"{'lmax':>5} {'err_gmres':>12} {'err_direct':>12} {'t_gmres(s)':>12} {'t_direct(s)':>12} {'t_eval(s)':>12}", flush=True)
     for li in range(Np):
-        t1, t2, t3 = test(lmax_list[li])
-        Tsolve[li] = t1
-        Tsolve_diag[li] = t2
-        Teval[li] = t3
+        print(f"  ... starting lmax={lmax_list[li]}", flush=True)
+        t1, t2, t3, e1, e2 = test(lmax_list[li])
+        Tsolve[li], Tsolve_diag[li], Teval[li] = t1, t2, t3
+        Egmres[li], Edirect[li] = e1, e2
+        print(f"{lmax_list[li]:>5d} {e1:>12.3e} {e2:>12.3e} {t1:>12.4f} {t2:>12.4f} {t3:>12.4f}", flush=True)
 
-    plt.plot(lmax_list, Tsolve, 'k*', label="gmres")
-    plt.plot(lmax_list, Tsolve_diag, 'k+', label="direct")
-    plt.plot(lmax_list, Teval, 'ko', label="off-surf eval")
-    plt.xlabel("lmax")
-    plt.ylabel("Time (s)")
+    # Timing plot.
+    plt.figure()
+    plt.plot(lmax_list, Tsolve, 'k*-', label="gmres")
+    plt.plot(lmax_list, Tsolve_diag, 'k+-', label="direct")
+    plt.plot(lmax_list, Teval, 'ko-', label="off-surf eval")
+    plt.xlabel("lmax"); plt.ylabel("Time (s)")
+    plt.title("Lap3d manufactured solution: timing")
     plt.legend()
-    plt.savefig('Lap3d_timing_2.png')
+    plt.savefig(os.path.join(here, '/plots/Lap3d_timing.png'), dpi=150)
+
+    # Convergence plot (true-solution relative error).
+    plt.figure()
+    plt.semilogy(lmax_list, Egmres, 'k*-', label="gmres")
+    plt.semilogy(lmax_list, Edirect, 'r+--', label="direct")
+    plt.xlabel("lmax"); plt.ylabel("max relative error vs exact")
+    plt.title("Lap3d manufactured solution: convergence")
+    plt.legend()
+    plt.savefig(os.path.join(here, '/plots/Lap3d_convergence.png'), dpi=150)
+    print("Wrote Lap3d_timing.png and Lap3d_convergence.png to", here)
