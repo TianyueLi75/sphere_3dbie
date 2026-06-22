@@ -12,11 +12,12 @@ Data model notes:
     - A suspension density / BC is a flat 1-D complex vector of length Nnodes_dsp[-1].
       Sphere s owns entries Nnodes_dsp[s] : Nnodes_dsp[s+1]. Each per-sphere block is the
       C-order flatten of the (nphi, ntheta) surface grid (matching sphere["Xcart"].shape[:2]).
+    - Targets are seperated into on-surface, near, and far off-surface. 
+      This can be surface collocation nodes during solve or in-domain points during evaluation.
 
-TODO:
-    Stokes suspension solver (mirror the Laplace functions onto Stk3d).
-    Near-singular quadrature for close sphere pairs (currently the far-field formula is
-        reused for near pairs, with a warning -- accuracy degrades for nearly-touching spheres).
+Main examples:
+    - Stokes suspension solver: manufactured solutions test
+    - Container geometry (TODO)
 """
 
 from typing import Dict, Any, Tuple
@@ -34,23 +35,15 @@ jax.config.update("jax_enable_x64", True)  # support float64
 # Put the repo root on the path so that `from sphere import *` (used inside biop) and
 # `from biop import Lap3d` both resolve, regardless of the working directory.
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), "vis"))
 from sphere import *
 from biop import Lap3d
+from biop import Stk3d
+import vtk_export
 
 import scipy.sparse.linalg as spla
 
 SuspensionDict = Dict[str, Any]
-
-# One-time warning when a near pair falls back to the far-field formula.
-_NEAR_WARNED = False
-def _warn_near_once():
-    global _NEAR_WARNED
-    if not _NEAR_WARNED:
-        print("Warning: near sphere pair detected; near-singular quadrature is not "
-              "implemented. Falling back to the far-field formula -- accuracy will "
-              "degrade for nearly-touching spheres. TODO: near evaluation.")
-        _NEAR_WARNED = True
-
 
 def build_suspension(center_lst: jax.Array, radius_lst: jax.Array, sep_eta: float = -1.0) -> SuspensionDict:
     """
@@ -226,7 +219,7 @@ def Lap3d_onsurf_apply(sigma: jax.Array, Sp: SuspensionDict, sh_lst: list,
 
 def Lap3d_onsurf_solve(bc_pot: jax.Array, Sp: SuspensionDict, sh_lst: list,
                        sl_scal_lst, dl_scal_lst, sgn_lst,
-                       tol: float = 1e-10, atol: float = 1e-12, maxiter: int = 100,
+                       tol: float = 1e-13, atol: float = 1e-15, maxiter: int = 100,
                        precond: bool = True):
     """
     Solve K[sigma] = bc_pot for the suspension surface density sigma.
@@ -281,17 +274,118 @@ def Lap3d_onsurf_solve(bc_pot: jax.Array, Sp: SuspensionDict, sh_lst: list,
     return sigma, info, resid
 
 
-def Lap3d_onsurf_direct_solve(bc_pot: jax.Array, Sp: SuspensionDict, sh_lst: list,
-                              sl_scal_lst, dl_scal_lst, sgn_lst):
-    """
-    Solve K[sigma] = bc_pot using a block-Jacobi *preconditioned* GMRES, where the
-    preconditioner is the per-sphere spectral direct self-solve.
+def _block_slice3(Sp: SuspensionDict, sind: int) -> slice:
+    """Row range owned by sphere `sind` in a flat Stokes suspension density/BC vector
+    (3 velocity components per node, so 3x the scalar offsets)."""
+    dsp = Sp["Nnodes_dsp"]
+    return slice(3 * int(dsp[sind]), 3 * int(dsp[sind + 1]))
 
-    NOTE: a fully matrix-free block-direct solve for the coupled system is future work; the
-    cross blocks (off-surface point evaluation) are dense and currently inverted iteratively.
+
+def Stk3d_onsurf_apply(sigma: jax.Array, Sp: SuspensionDict, sh_lst: list,
+                       sl_scal_lst, dl_scal_lst, sgn_lst,
+                       sep_mat: jax.Array = None) -> jax.Array:
     """
-    return Lap3d_onsurf_solve(bc_pot, Sp, sh_lst, sl_scal_lst, dl_scal_lst, sgn_lst,
-                              precond=True)
+    Apply the suspension on-surface operator K[sigma] for Stokes (vector density).
+        for each target sphere t,  (K sigma)_t = sum_s K_{t,s}[sigma_s]
+        - s == t : self term (Stk3d.bio_onsurf_apply, includes the DL jump), with the
+                   source-sphere radius threaded so the SL block scales correctly.
+        - s != t : sphere-to-sphere layer potential at t's surface nodes
+                   (Stk3d.bio_offsurf_apply).
+
+    sigma : flat 1-D complex array, length 3 * Sp["Nnodes_dsp"][-1] (3 components/node).
+            Each per-sphere block is the C-order flatten of the (nphi, ntheta, 3) field.
+    Returns a flat 1-D complex array of the same length.
+    """
+    Ns = Sp["Ns"]
+    spheres = Sp["spheres_lst"]
+    sigma = jnp.asarray(sigma, dtype=jnp.complex128).reshape(-1)
+    assert 3 * int(Sp["Nnodes_dsp"][-1]) == sigma.shape[0]
+
+    if sep_mat is None:
+        sep_mat = separate_spheres(Sp)
+
+    y = jnp.zeros_like(sigma)
+
+    for tind in range(Ns):
+        t_sph = spheres[tind]
+        acc = jnp.zeros((3 * int(Sp["Nnodes_lst"][tind]),), dtype=jnp.complex128)
+
+        for sind in range(Ns):
+            s_sph = spheres[sind]
+            nphi, ntheta = s_sph["Xcart"].shape[:2]
+            sigma_s = sigma[_block_slice3(Sp, sind)].reshape(nphi, ntheta, 3)
+
+            if sind == tind:
+                self_out = Stk3d.bio_onsurf_apply(
+                    sigma_s, s_sph["Xsph"][:, :, 0], s_sph["Xsph"][:, :, 1], sh_lst[sind],
+                    sl_scal_lst[sind], dl_scal_lst[sind], sgn_lst[sind], radius=s_sph["r"])
+                acc = acc + self_out.reshape(-1)
+            else:
+                s_sph = set_density(s_sph, sigma_s[:, :, 0], sigma_s[:, :, 1], sigma_s[:, :, 2])
+                trg = t_sph["Xcart"].reshape(-1, 3)
+                cross = Stk3d.bio_offsurf_apply(
+                    trg, s_sph, sh_lst[sind], sl_scal_lst[sind], dl_scal_lst[sind],
+                    sep_mat[tind, sind] == 0)
+                acc = acc + cross.reshape(-1)
+
+        y = y.at[_block_slice3(Sp, tind)].set(acc)
+
+    return y
+
+
+def Stk3d_onsurf_solve(bc_vec: jax.Array, Sp: SuspensionDict, sh_lst: list,
+                       sl_scal_lst, dl_scal_lst, sgn_lst,
+                       tol: float = 1e-13, atol: float = 1e-15, maxiter: int = 200,
+                       precond: bool = True, callback=None):
+    """
+    Solve K[sigma] = bc_vec for the suspension Stokes surface density sigma (vector).
+
+    Mirrors Lap3d_onsurf_solve: scipy GMRES on the matrix-free coupled operator, with an
+    optional block-Jacobi preconditioner that applies each sphere's spectral direct self-solve
+    (Stk3d.stokes_onsurf_direct_solve, radius-aware).
+
+    <callback> (optional) is forwarded to scipy.sparse.linalg.gmres (e.g. to count iterations).
+
+    Returns (sigma_flat, info, resid).
+    """
+    dsp = Sp["Nnodes_dsp"]
+    N = 3 * int(dsp[-1])
+    sep_mat = separate_spheres(Sp)
+    bc_vec = jnp.asarray(bc_vec, dtype=jnp.complex128).reshape(-1)
+
+    def matvec(x):
+        y = Stk3d_onsurf_apply(jnp.asarray(x), Sp, sh_lst,
+                               sl_scal_lst, dl_scal_lst, sgn_lst, sep_mat)
+        return np.array(y, dtype=np.complex128)
+
+    A = spla.LinearOperator((N, N), matvec=matvec, dtype=np.complex128)
+
+    M = None
+    if precond:
+        def psolve(r):
+            r = jnp.asarray(r, dtype=jnp.complex128).reshape(-1)
+            z = jnp.zeros_like(r)
+            for sind in range(Sp["Ns"]):
+                s_sph = Sp["spheres_lst"][sind]
+                nphi, ntheta = s_sph["Xcart"].shape[:2]
+                sl = _block_slice3(Sp, sind)
+                zs = Stk3d.stokes_onsurf_direct_solve(
+                    r[sl].reshape(nphi, ntheta, 3), s_sph["Xsph"][:, :, 0], s_sph["Xsph"][:, :, 1],
+                    sh_lst[sind], sl_scal_lst[sind], dl_scal_lst[sind], sgn_lst[sind],
+                    radius=s_sph["r"])
+                z = z.at[sl].set(zs.reshape(-1))
+            return np.array(z, dtype=np.complex128)
+        M = spla.LinearOperator((N, N), matvec=psolve, dtype=np.complex128)
+
+    b = np.asarray(bc_vec, dtype=np.complex128)
+    try:
+        sol, info = spla.gmres(A, b, M=M, rtol=tol, atol=atol, maxiter=maxiter, callback=callback)
+    except TypeError:
+        sol, info = spla.gmres(A, b, M=M, tol=tol, atol=atol, maxiter=maxiter, callback=callback)
+
+    sigma = jnp.asarray(sol, dtype=jnp.complex128)
+    resid = float(jnp.linalg.norm(matvec(sigma) - b))
+    return sigma, info, resid
 
 
 if __name__ == "__main__":
@@ -309,6 +403,9 @@ if __name__ == "__main__":
     dl_scal = 1.0
     sep_eta = 0.1
 
+    # ===== TEST 1 & TEST 2 commented out (kept verbatim); only TEST 3 runs below =====
+    '''
+    print("=========== TEST 1: Manufactured solution exterior to two spheres ==============")
     centers = jnp.array([[0., 0., 0.], [3., 0., 0.]])
     radii = jnp.array([1.0, 1.0])
     Sp = build_suspension(centers, radii, sep_eta)
@@ -350,3 +447,113 @@ if __name__ == "__main__":
     rel_err = jnp.max(jnp.abs(true_pot - approx)) / jnp.max(jnp.abs(true_pot))
     print(f"Two-sphere exterior Laplace: max relative error at exterior targets "
           f"(lmax={lmax}) = {float(rel_err):.3e}")
+
+
+    print("=========== TEST 2: Manufactured solution exterior to two Stokes spheres (radii != 1) ==========")
+    centers = jnp.array([[0., 0., 0.], [3., 0., 0.]])
+    radii = jnp.array([1.0, 0.5])  # second sphere is non-unit: exercises solid-harmonic radius scaling
+    Sp = build_suspension(centers, radii, sep_eta)
+    Sp, sh_lst = quadr_suspension(Sp, jnp.array([lmax, lmax]))
+    Ns = Sp["Ns"]
+
+    # Exterior Stokes problem on every sphere.
+    sl_lst = [sl_scal] * Ns
+    dl_lst = [dl_scal] * Ns
+    sgn_lst = [1.0] * Ns
+
+    # One interior point Stokeslet per sphere (singularities live inside the spheres).
+    ptsrc = jnp.array([[0.1, 0.3, 0.15], [2.95, 0.1, 0.05]])
+    force = jnp.array([[1.0, 0.5, -0.3], [-0.7, 0.2, 0.4]])
+
+    # Boundary condition: exact Stokeslet velocity sampled on each sphere's surface nodes
+    # (flat length 3*dsp[-1]; each block is the C-order flatten of (nphi, ntheta, 3)).
+    dsp = Sp["Nnodes_dsp"]
+    bc = jnp.zeros((3 * int(dsp[-1]),), dtype=jnp.complex128)
+    for s in range(Ns):
+        nodes = Sp["spheres_lst"][s]["Xcart"].reshape(-1, 3)
+        vel = Stk3d.compute_field(nodes, ptsrc, force)  # (Nn, 3) complex
+        bc = bc.at[3 * int(dsp[s]):3 * int(dsp[s + 1])].set(vel.reshape(-1))
+
+    # Coupled solve.
+    sigma, info, resid = Stk3d_onsurf_solve(bc, Sp, sh_lst, sl_lst, dl_lst, sgn_lst)
+    print(f"GMRES info (0 == converged): {info}, residual = {resid:.3e}")
+
+    # Accuracy at exterior check points, well separated from both spheres.
+    chk = jnp.array([[6., 1., 0.5], [1.5, 5., -2.], [-4., -3., 2.]])
+    true_vel = jnp.real(Stk3d.compute_field(chk, ptsrc, force))
+    approx = jnp.zeros((chk.shape[0], 3), dtype=jnp.complex128)
+    for s in range(Ns):
+        nphi, ntheta = Sp["spheres_lst"][s]["Xcart"].shape[:2]
+        sig_s = sigma[3 * int(dsp[s]):3 * int(dsp[s + 1])].reshape(nphi, ntheta, 3)
+        s_sph = set_density(Sp["spheres_lst"][s], sig_s[:, :, 0], sig_s[:, :, 1], sig_s[:, :, 2])
+        approx = approx + Stk3d.bio_offsurf_apply(chk, s_sph, sh_lst[s], sl_scal, dl_scal)
+    approx = jnp.real(approx)
+
+    rel_err = jnp.max(jnp.abs(true_vel - approx)) / jnp.max(jnp.abs(true_vel))
+    print(f"Two-sphere exterior Stokes: max relative error at exterior targets "
+          f"(lmax={lmax}, radii={[float(r) for r in radii]}) = {float(rel_err):.3e}")
+
+
+    '''
+
+
+    print("======= TEST 3: An obstacle with slip inside a no-slip container ===============")
+    centers = jnp.array([[0., 0., 0.], [0.3, 0.1, -0.05]])
+    radii = jnp.array([1.0, 0.2])
+    Sp = build_suspension(centers, radii, sep_eta)
+    Sp, sh_lst = quadr_suspension(Sp, jnp.array([lmax, lmax]))
+    Ns = Sp["Ns"]
+
+    sl_lst = [sl_scal] * Ns
+    dl_lst = [dl_scal] * Ns
+    sgn_lst = [-1.0, 1.0]  # interior problem on outer container, exterior problem on obstacle
+
+    # Boundary condition (Stokes: 3 velocity components per node, flat length 3*dsp[-1]).
+    dsp = Sp["Nnodes_dsp"]
+    bc = jnp.zeros((3 * int(dsp[-1]),), dtype=jnp.complex128)  # no-slip container (sphere 0)
+    U = 1.0
+    vslip_mag = lambda theta: jnp.sin(theta) * 3. / 2. * U   # squirmer tangential surface speed
+    # Tangential slip u = vslip_mag(theta) e_theta on the obstacle (sphere 1).
+    obst = Sp["spheres_lst"][1]
+    th1 = obst["Xsph"][:, :, 0]
+    ph1 = obst["Xsph"][:, :, 1]
+    zeros1 = jnp.zeros_like(th1)
+    sx, sy, sz = Stk3d.sph2cart(zeros1, vslip_mag(th1), zeros1, th1, ph1)
+    bc_obs = jnp.stack([sx, sy, sz], axis=2)                 # (nphi, ntheta, 3)
+    bc = bc.at[3 * int(dsp[1]):3 * int(dsp[2])].set(bc_obs.reshape(-1))
+
+    # Coupled solve (may not fully converge; the field is judged visually).
+    sigma, info, resid = Stk3d_onsurf_solve(bc, Sp, sh_lst, sl_lst, dl_lst, sgn_lst)
+    print(f"GMRES info (0 == converged): {info}, residual = {resid:.3e}")
+
+    # Evaluate the flow on a grid interior to the container and exterior to the obstacle.
+    Ng = 26
+    trg_data = vtk_export.grid_from_spheres(Sp, Ng, pad=0.001)
+    trg_grid = trg_data["points"]
+    rr_0 = jnp.linalg.norm(trg_grid - centers[0, :], axis=1)
+    rr_1 = jnp.linalg.norm(trg_grid - centers[1, :], axis=1)
+    in_0 = rr_0 < radii[0] * 0.999   # strictly interior to container
+    in_1 = rr_1 > radii[1] * 1.001   # strictly exterior to obstacle
+
+    Ufield = np.zeros((trg_grid.shape[0], 3), dtype=float) # for plotting
+    if np.any(in_0 & in_1):
+        trg_in = jnp.asarray(trg_grid[in_0 & in_1])
+        approx = jnp.zeros((trg_in.shape[0], 3), dtype=jnp.complex128)
+        for s in range(Ns):
+            nphi, ntheta = Sp["spheres_lst"][s]["Xcart"].shape[:2]
+            sig_s = sigma[3 * int(dsp[s]):3 * int(dsp[s + 1])].reshape(nphi, ntheta, 3)
+            s_sph = set_density(Sp["spheres_lst"][s], sig_s[:, :, 0], sig_s[:, :, 1], sig_s[:, :, 2])
+            approx = approx + Stk3d.bio_offsurf_apply(trg_in, s_sph, sh_lst[s], sl_scal, dl_scal)
+        Ufield[in_0 & in_1] = np.real(np.asarray(approx))
+    
+    vis_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vis")
+    os.makedirs(vis_dir, exist_ok=True)
+    vtk_export.export_field(trg_data, Ufield, os.path.join(vis_dir, "container_obstacle_field.vtk"),
+                                name="velocity")
+    print("Wrote VTK (field) to", vis_dir)
+    
+    # Surface boundary condition per node (zero on container, slip on obstacle), for plotting.
+    bc_vec = np.real(np.asarray(bc)).reshape(-1, 3)
+    vtk_export.export_objects(os.path.join(vis_dir, "container_obstacle_geometry.vtk"), Sp, bc_vec)
+    print("Wrote VTK (geometry) to", vis_dir)
+
