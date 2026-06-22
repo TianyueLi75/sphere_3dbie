@@ -95,6 +95,6 @@ def separate_target(trg: jax.Array, S: SphereDict, sep_eta: float) -> jax.Array:
             trg = jnp.transpose(trg)
 
     trg_dc = jnp.linalg.norm(trg - S["Xc"], axis=1) # per-target distance to sphere center
-    sep_vec = (trg_dc - S["r"]) > sep_eta # far if the surface gap exceeds sep_eta
+    sep_vec = (trg_dc - S["r"]) > sep_eta * S["r"] # far if the surface gap exceeds sep_eta * r
 
     return sep_vec

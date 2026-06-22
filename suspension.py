@@ -130,7 +130,8 @@ def separate_spheres(Sp: SuspensionDict) -> jax.Array:
             s_sph = spheres[sind]
             t_sph = spheres[tind]
             gap = jnp.linalg.norm(s_sph["Xc"] - t_sph["Xc"]) - s_sph["r"] - t_sph["r"]
-            is_far = int(gap > Sp["sep_eta"])
+            max_r = jnp.max([s_sph["r"], t_sph["r"]])
+            is_far = int(gap > Sp["sep_eta"] * max_r)
             sep_mat = sep_mat.at[tind, sind].set(is_far)
             sep_mat = sep_mat.at[sind, tind].set(is_far)
 
