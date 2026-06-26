@@ -61,6 +61,7 @@ def test(lmax: int):
         solver=solver,
         options={"y0": jnp.zeros(x.shape, dtype=jnp.complex128)},
     )
+    jax.block_until_ready(solution.value)   # warmup: finish compile before timing
     tstart = time.time()
     solution = lx.linear_solve(
         gmres_func,
@@ -68,6 +69,7 @@ def test(lmax: int):
         solver=solver,
         options={"y0": jnp.zeros(x.shape, dtype=jnp.complex128)},
     )
+    jax.block_until_ready(solution.value)
     tend = time.time()
     time_gmres = tend - tstart
 
@@ -85,6 +87,7 @@ def test(lmax: int):
         dl_scal=dl_scal,
         sgn=sgn
     )
+    jax.block_until_ready(sig_direct)   # warmup: finish compile before timing
     tstart = time.time()
     sig_direct = bio_onsurf_direct_solve(
         bc_pot=BC_pot,
@@ -93,6 +96,7 @@ def test(lmax: int):
         dl_scal=dl_scal,
         sgn=sgn
     )
+    jax.block_until_ready(sig_direct)
     tend = time.time()
     time_direct = tend - tstart
 
@@ -110,6 +114,7 @@ def test(lmax: int):
 
     S = set_density(S, sig_gmres)
     Ksig_gmres = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
+    jax.block_until_ready(Ksig_gmres)   # warmup eval: finish compile before the timed direct eval
     Ksig_gmres = jnp.real(jnp.reshape(Ksig_gmres,(-1,1)))
 
     S = set_density(S, sig_direct)
@@ -151,7 +156,7 @@ if __name__ == "__main__":
     plt.xlabel("lmax"); plt.ylabel("Time (s)")
     plt.title("Lap3d manufactured solution: timing")
     plt.legend()
-    plt.savefig(os.path.join(here, '/plots/Lap3d_timing.png'), dpi=150)
+    plt.savefig(os.path.join(here, './plots/Lap3d_timing.svg'), format="svg", dpi=150)
 
     # Convergence plot (true-solution relative error).
     plt.figure()
@@ -160,5 +165,5 @@ if __name__ == "__main__":
     plt.xlabel("lmax"); plt.ylabel("max relative error vs exact")
     plt.title("Lap3d manufactured solution: convergence")
     plt.legend()
-    plt.savefig(os.path.join(here, '/plots/Lap3d_convergence.png'), dpi=150)
-    print("Wrote Lap3d_timing.png and Lap3d_convergence.png to", here)
+    plt.savefig(os.path.join(here, './plots/Lap3d_convergence.svg'), format="svg", dpi=150)
+    print("Wrote Lap3d_timing.svg and Lap3d_convergence.svg to", here)

@@ -106,8 +106,8 @@ def make_check_points(n=64, seed=0):
 
 
 if __name__ == "__main__":
-    # lmax from 14 to 200, geometrically spaced (cost grows steeply with lmax).
-    lmax_list = sorted(set(int(round(v)) for v in np.geomspace(20, 100, 4)))
+    # lmax_list = [2**n for n in range(2, 13)]
+    lmax_list = [2**n for n in range(2, 8)]
     chk = make_check_points()
 
     t_solve = np.zeros(len(lmax_list))
@@ -139,13 +139,13 @@ if __name__ == "__main__":
     plt.xlabel("lmax"); plt.ylabel("Time (s)")
     plt.title("Container-obstacle Stokes: timing")
     plt.legend()
-    plt.savefig(os.path.join(here, "/plots/Stk3d_container_obstacle_timing.png"), dpi=150)
+    plt.savefig(os.path.join(here, "./plots/Stk3d_container_obstacle_timing.png"), dpi=150)
 
     # Self-convergence plot (drop the reference point, which is 0 by construction).
     plt.figure()
     plt.semilogy(lmax_list[:-1], err[:-1], "k*-")
     plt.xlabel("lmax"); plt.ylabel(f"max rel diff vs lmax={lmax_list[-1]}")
     plt.title("Container-obstacle Stokes: self-convergence")
-    plt.savefig(os.path.join(here, "/plots/Stk3d_container_obstacle_convergence.png"), dpi=150)
+    plt.savefig(os.path.join(here, "./plots/Stk3d_container_obstacle_convergence.png"), dpi=150)
 
     print("\nWrote Stk3d_container_obstacle_timing.png and Stk3d_container_obstacle_convergence.png to", here)
