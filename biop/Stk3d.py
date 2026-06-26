@@ -326,6 +326,246 @@ def Stk3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: s
                                Strg["Xsph"][:, :, 0], Strg["Xsph"][:, :, 1],
                                S["r"], Strg["r"], sh, shtrg, exterior)
 
+def _ps_rotation(t_vec: np.ndarray, lmax_src: int, lmax_trg: int) -> tuple:
+    """Forward/inverse shtns rotations that bring the target-center direction onto
+    the +z pole (and back). Built with set_angle_axis (axis = t_hat x z_hat, angle
+    = acos(t_z/d)); verified so the rotated expansion sampled at the pole equals the
+    original sampled at t_hat. Degenerate t along +/-z falls back to an x-axis flip.
+    The forward rotation acts on the SOURCE coefficients (stage 1) so it is built at
+    <lmax_src>; the inverse acts on the TARGET coefficients (stage 3) so it is built
+    at <lmax_trg>. Returns (rot_fwd, rot_inv, d)."""
+    t = np.asarray(t_vec, dtype=np.float64).reshape(3)
+    d = float(np.linalg.norm(t))
+    that = t / d
+    beta = float(np.arccos(np.clip(that[2], -1.0, 1.0)))
+    axis = np.array([that[1], -that[0], 0.0])   # t_hat x z_hat
+    nrm = float(np.linalg.norm(axis))
+    axis = np.array([1.0, 0.0, 0.0]) if nrm < 1e-14 else axis / nrm
+    ax = (float(axis[0]), float(axis[1]), float(axis[2]))
+    rot_fwd = shtns.rotation(lmax_src, lmax_src, 0)   # mmax=lmax => exact rotation
+    rot_fwd.set_angle_axis(beta, *ax)
+    rot_inv = shtns.rotation(lmax_trg, lmax_trg, 0)
+    rot_inv.set_angle_axis(-beta, *ax)
+    return rot_fwd, rot_inv, d
+
+def _ps_target_rings(d: float, R_t: float, theta_std: np.ndarray) -> tuple:
+    """Source-centered (r_j, cos_theta_src_j) for each target-local theta ring,
+    after the target center is placed on the +z axis at distance d (radius R_t).
+    Within a ring all nphi points share these (translation along +z preserves phi)."""
+    theta_std = np.asarray(theta_std, dtype=np.float64)
+    ct = np.cos(theta_std); st = np.sin(theta_std)
+    z = d + R_t * ct
+    r = np.sqrt((R_t * st) ** 2 + z * z)
+    return r, z / r
+
+def _latlm_maps(sh: shtns_jax.sht) -> tuple:
+    """Cached cplx->real-layout gather indices + parity for the G/H split used by
+    _stk_latitude_cplx. For each real-layout index (degree l, order m>=0): gather
+    from the cplx layout at k_pos = l(l+1)+m and k_neg = l(l+1)-m, with parity (-1)^m."""
+    cached = getattr(sh, "_ps_latlm_maps", None)
+    if cached is not None:
+        return cached
+    lr = np.asarray(sh.l, dtype=np.int64)
+    mr = np.asarray(sh.m, dtype=np.int64)
+    kpos = (lr * (lr + 1) + mr).astype(np.int64)
+    kneg = (lr * (lr + 1) - mr).astype(np.int64)
+    parity = ((-1.0) ** mr).astype(np.float64)
+    maps = (kpos, kneg, parity)
+    sh._ps_latlm_maps = maps
+    return maps
+
+def _stk_latitude_cplx(qlm: np.ndarray, slm: np.ndarray, tlm: np.ndarray,
+                       cos_src: np.ndarray, sh: shtns_jax.sht) -> tuple:
+    """FFT-accelerated evaluation of complex Q/S/T expansions -- one per target ring
+    (coeff arrays shaped (ntheta, nlm_cplx), already radius-scaled) -- at each ring's
+    latitude cos_src[j] over all nphi longitudes. Reuses the vetted real FFT path
+    sht.SHqst_to_lat by splitting each complex coefficient array into the real-layout
+    coefficients of its real (G) and imaginary (H) parts. Returns (vr, vt, vp), each
+    (nphi, ntheta) complex, in the source-centered spherical basis."""
+    ntheta = cos_src.shape[0]
+    nphi = sh.nphi
+    kpos, kneg, parity = _latlm_maps(sh)
+
+    def split(z):
+        zp = z[kpos]; zn = z[kneg]
+        aG = np.ascontiguousarray(0.5 * (zp + parity * np.conj(zn)))
+        aH = np.ascontiguousarray((zp - parity * np.conj(zn)) / 2j)
+        return aG, aH
+
+    vr = np.empty((nphi, ntheta), dtype=np.complex128)
+    vt = np.empty((nphi, ntheta), dtype=np.complex128)
+    vp = np.empty((nphi, ntheta), dtype=np.complex128)
+    VrG = np.empty(nphi); VtG = np.empty(nphi); VpG = np.empty(nphi)
+    VrH = np.empty(nphi); VtH = np.empty(nphi); VpH = np.empty(nphi)
+    qlm = np.ascontiguousarray(qlm, dtype=np.complex128)
+    slm = np.ascontiguousarray(slm, dtype=np.complex128)
+    tlm = np.ascontiguousarray(tlm, dtype=np.complex128)
+    for j in range(ntheta):
+        Qg, Qh = split(qlm[j]); Sg, Sh = split(slm[j]); Tg, Th = split(tlm[j])
+        cj = float(cos_src[j])
+        sh.SHqst_to_lat(Qg, Sg, Tg, cj, VrG, VtG, VpG)
+        sh.SHqst_to_lat(Qh, Sh, Th, cj, VrH, VtH, VpH)
+        vr[:, j] = VrG + 1j * VrH
+        vt[:, j] = VtG + 1j * VtH
+        vp[:, j] = VpG + 1j * VpH
+    return vr, vt, vp
+
+def _ps_scale_vwx(vlm: np.ndarray, wlm: np.ndarray, xlm: np.ndarray,
+                  rho: np.ndarray, l_vals: np.ndarray, exterior: bool, which: str) -> tuple:
+    """Apply the per-ring solid-harmonic radial scaling of the SL ('sl') or DL ('dl')
+    operator (in the V/W/X diagonalizing basis) to the rotated source coefficients.
+    rho is (ntheta, 1), l_vals is (nlm,); broadcasting gives (ntheta, nlm). The
+    exterior/interior formulas mirror _stk_sl_1sph_kernel / _stk_dl_1sph_kernel
+    exactly (SL is NOT scaled by a here; the caller applies it)."""
+    if which == "sl":
+        diag_V = l_vals / (2.0*l_vals+1.0) / (2.0*l_vals+3.0)
+        diag_W = (l_vals+1.0) / (2.0*l_vals+1.0) / (2.0*l_vals-1.0)
+        diag_X = 1.0 / (2.0*l_vals+1.0)
+        if exterior:
+            diag_W2V = l_vals / (4.0*l_vals+2.0)
+            coup = (rho**(-l_vals-2.0) - rho**(-l_vals)) * diag_W2V * wlm
+            vlm_o = rho**(-l_vals-2.0) * diag_V * vlm + coup
+            wlm_o = rho**(-l_vals) * diag_W * wlm
+            xlm_o = rho**(-l_vals-1.0) * diag_X * xlm
+        else:
+            diag_V2W = (l_vals+1.0) / (4.0*l_vals+2.0)
+            coup = (rho**(l_vals+1.0) - rho**(l_vals-1.0)) * diag_V2W * vlm
+            vlm_o = rho**(l_vals+1.0) * diag_V * vlm
+            wlm_o = rho**(l_vals-1.0) * diag_W * wlm + coup
+            xlm_o = rho**(l_vals) * diag_X * xlm
+        return vlm_o, wlm_o, xlm_o
+    # DL
+    dVe = (2.0*l_vals*l_vals + 4*l_vals + 3) / (2.0*l_vals+1.0) / (2.0*l_vals+3.0)
+    dWe = 2.0*(l_vals+1.0)*(l_vals-1.0) / (2.0*l_vals+1.0) / (2.0*l_vals-1.0)
+    dXe = (l_vals-1.0) / (2.0*l_vals+1.0)
+    dVi = -2.0*l_vals*(l_vals+2) / (2.0*l_vals+1.0) / (2.0*l_vals+3.0)
+    dWi = -(2.0*l_vals*l_vals+1.0) / (2.0*l_vals+1.0) / (2.0*l_vals-1.0)
+    dXi = -(l_vals+2.0) / (2.0*l_vals+1.0)
+    if exterior:
+        diag_W2V = 2.0*l_vals*(l_vals-1.0) / (4.0*l_vals+2.0)
+        coup = (rho**(-l_vals-2.0) - rho**(-l_vals)) * diag_W2V * wlm
+        vlm_o = rho**(-l_vals-2.0) * dVe * vlm + coup
+        wlm_o = rho**(-l_vals) * dWe * wlm
+        xlm_o = rho**(-l_vals-1.0) * dXe * xlm
+    else:
+        diag_V2W = (l_vals+1.0)*(l_vals+2.0) / (2.0*l_vals+1.0)
+        coup = (-rho**(l_vals+1.0) + rho**(l_vals-1.0)) * diag_V2W * vlm
+        vlm_o = rho**(l_vals+1.0) * dVi * vlm
+        wlm_o = rho**(l_vals-1.0) * dWi * wlm + coup
+        xlm_o = rho**(l_vals) * dXi * xlm
+    return vlm_o, wlm_o, xlm_o
+
+def point_n_shoot(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: shtns_jax.sht,
+                  sl_scal: float, dl_scal: float, near: bool = False) -> jax.Array:
+    """
+    Point-and-shoot (move-pole) evaluation of the combined Stokes layer potential
+        K = sl_scal*SL + dl_scal*DL
+    of source sphere <S> (density S["Sigma"]) at the surface grid of a target sphere
+    <Strg> that is NOT concentric with <S>. Implements the 3-stage FFT-accelerated
+    near-evaluation of Corona & Veerapaneni 2018 (JCP 362), Sec. 4.2 / Fig. 2:
+      (1) rotate the source Q/S/T density coefficients so the target center lies on
+          the +z pole (Wigner-D, shtns rotation.apply_cplx, each scalar potential
+          rotated independently);
+      (2) on the now pole-aligned target rings (constant source-centered r, theta per
+          ring), apply the solid-harmonic radial scaling and evaluate with one FFT in
+          longitude per ring (O(p^3 log p));
+      (3) rotate the sampled field back to the global frame.
+    <near> is accepted for API symmetry with bio_offsurf_apply but does not change the
+    radial branch (it is fixed by the geometry: target fully exterior or interior to S).
+    Returns velocity at Strg's grid: (nphi_t, ntheta_t, 3) complex.
+    """
+    if S["lmax"] != sh.lmax:
+        print("S lmax does not match sht's lmax, reform sht.")
+        sh = shtns_jax.sht(S["lmax"], S["lmax"])
+    if Strg["lmax"] != shtrg.lmax:
+        print("Strg lmax does not match sht_trg's lmax, reform sht_trg.")
+        shtrg = shtns_jax.sht(Strg["lmax"], Strg["lmax"])
+
+    a = float(S["r"]); R_t = float(Strg["r"])
+    t_vec = np.asarray(Strg["Xc"], dtype=np.float64) - np.asarray(S["Xc"], dtype=np.float64)
+    # Evaluate stages 2-3 at the finer of the two resolutions so no source content is
+    # dropped before the radial scaling; band-limit to the target only at the final
+    # synthesis. sh_eval owns that working grid (sh or shtrg, whichever has higher lmax).
+    sh_eval = sh if sh.lmax >= shtrg.lmax else shtrg
+    rot_fwd, rot_inv, d = _ps_rotation(t_vec, sh.lmax, sh_eval.lmax)
+
+    # Distances from the source center to the target sphere surface span
+    # [|d - R_t|, d + R_t]; pick the (uniform) exterior or interior radial branch.
+    if abs(d - R_t) > a:
+        exterior = True
+    elif d + R_t < a:
+        exterior = False
+    else:
+        raise ValueError(
+            f"point_n_shoot requires the target sphere to be wholly exterior or "
+            f"interior to the source (non-overlapping); got d={d}, a={a}, R_t={R_t}.")
+
+    # ---- source density -> Q/S/T coefficients (cplx layout) ----
+    th_s = S["Xsph"][:, :, 0]; ph_s = S["Xsph"][:, :, 1]
+    sr, st_s, sp_s = cart2sph(S["Sigma"][:, :, 0], S["Sigma"][:, :, 1], S["Sigma"][:, :, 2], th_s, ph_s)
+    qst_src = sh.analys_vec_cplx_jax(vec_stack(sr, st_s, sp_s))   # (3, nlm_src)
+    q_src = np.ascontiguousarray(np.asarray(qst_src[0], dtype=np.complex128))
+    s_src = np.ascontiguousarray(np.asarray(qst_src[1], dtype=np.complex128))
+    t_src = np.ascontiguousarray(np.asarray(qst_src[2], dtype=np.complex128))
+
+    # ---- STAGE 1: rotate each scalar potential so the target center -> +z ----
+    qR = rot_fwd.apply_cplx(q_src); sR = rot_fwd.apply_cplx(s_src); tR = rot_fwd.apply_cplx(t_src)
+    nlm_e = sh_eval.nlm_cplx
+    def _pad(z, n):   # lmax_eval >= lmax_src, so on the source this only zero-pads
+        return np.concatenate([z, np.zeros(n - z.shape[0], dtype=np.complex128)]) if n > z.shape[0] else z[:n]
+    qR = _pad(qR, nlm_e); sR = _pad(sR, nlm_e); tR = _pad(tR, nlm_e)
+
+    # ---- STAGE 2: per-ring radial scaling + latitude FFT evaluation (sh_eval grid) ----
+    l_vals = np.asarray(sh_eval.zl, dtype=np.float64)           # (nlm_e,)
+    vlm = (l_vals * sR - qR) / (2.0*l_vals + 1.0)               # rotated source VWX
+    wlm = ((l_vals + 1.0) * sR + qR) / (2.0*l_vals + 1.0)
+    xlm = -tR
+
+    theta_e = np.arccos(np.asarray(sh_eval.cos_theta))          # (ntheta_e,)
+    r_j, cos_src = _ps_target_rings(d, R_t, theta_e)
+    rho = (r_j / a)[:, None]                                    # (ntheta_e, 1)
+
+    vSL, wSL, xSL = _ps_scale_vwx(vlm, wlm, xlm, rho, l_vals, exterior, "sl")
+    vDL, wDL, xDL = _ps_scale_vwx(vlm, wlm, xlm, rho, l_vals, exterior, "dl")
+    vK = sl_scal*a*vSL + dl_scal*vDL                            # SL scales by a
+    wK = sl_scal*a*wSL + dl_scal*wDL
+    xK = sl_scal*a*xSL + dl_scal*xDL
+
+    slm_K = vK + wK                                             # VWX -> QST (per ring)
+    qlm_K = l_vals*(wK - vK) - vK
+    tlm_K = -xK
+
+    vr, vt, vp = _stk_latitude_cplx(qlm_K, slm_K, tlm_K, cos_src, sh_eval)  # (nphi_e, ntheta_e)
+
+    # source-centered spherical components -> Cartesian (rotated frame), on the sh_eval grid
+    phi_e = (np.arange(sh_eval.nphi) * 2.0*np.pi/sh_eval.nphi)[:, None]
+    theta_src = np.broadcast_to(np.arccos(cos_src)[None, :], vr.shape)
+    uxR, uyR, uzR = sph2cart(vr, vt, vp, theta_src, np.broadcast_to(phi_e, vr.shape))
+
+    # ---- STAGE 3: rotate the sampled field back, band-limit to the target grid ----
+    th_e = np.broadcast_to(theta_e[None, :], vr.shape)          # sh_eval target-local angles
+    ph_e = np.broadcast_to(phi_e, vr.shape)
+    vr_e, vt_e, vp_e = cart2sph(uxR, uyR, uzR, th_e, ph_e)
+    qst_R = np.asarray(sh_eval.analys_vec_cplx_jax(vec_stack(vr_e, vt_e, vp_e)), dtype=np.complex128)
+    qg = rot_inv.apply_cplx(np.ascontiguousarray(qst_R[0]))
+    sg = rot_inv.apply_cplx(np.ascontiguousarray(qst_R[1]))
+    tg = rot_inv.apply_cplx(np.ascontiguousarray(qst_R[2]))
+    nlm_t = shtrg.nlm_cplx                                      # truncate/pad eval -> target lmax
+    qst_g = jnp.stack([jnp.asarray(_pad(qg, nlm_t)), jnp.asarray(_pad(sg, nlm_t)),
+                       jnp.asarray(_pad(tg, nlm_t))], axis=0)
+    vr_g, vt_g, vp_g = vec_distr(shtrg.synth_vec_cplx_jax(qst_g))
+    th_t = Strg["Xsph"][:, :, 0]; ph_t = Strg["Xsph"][:, :, 1]
+    ux, uy, uz = sph2cart(vr_g, vt_g, vp_g, th_t, ph_t)
+    return jnp.stack([ux, uy, uz], axis=2)
+
+def Stk3d_dl_point_and_shoot(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
+    """DL-only point-and-shoot (thin wrapper over point_n_shoot)."""
+    return point_n_shoot(Strg, shtrg, S, sh, 0.0, 1.0, near=False)
+
+
+
+
+
 def _stk_trg_sph(trg: jax.Array, S: SphereDict) -> tuple([jax.Array, jax.Array, jax.Array]):
     """Spherical coordinates (dr, theta, phi) of targets <trg> relative to S["Xc"]."""
     trg_dx = trg[:,0] - S["Xc"][0]

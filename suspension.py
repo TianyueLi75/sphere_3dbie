@@ -123,7 +123,7 @@ def separate_spheres(Sp: SuspensionDict) -> jax.Array:
             s_sph = spheres[sind]
             t_sph = spheres[tind]
             gap = jnp.linalg.norm(s_sph["Xc"] - t_sph["Xc"]) - s_sph["r"] - t_sph["r"]
-            max_r = jnp.max([s_sph["r"], t_sph["r"]])
+            max_r = max(s_sph["r"], t_sph["r"])   # Python floats; jnp.max rejects a list
             is_far = int(gap > Sp["sep_eta"] * max_r)
             sep_mat = sep_mat.at[tind, sind].set(is_far)
             sep_mat = sep_mat.at[sind, tind].set(is_far)
@@ -323,8 +323,11 @@ def Stk3d_onsurf_apply(sigma: jax.Array, Sp: SuspensionDict, sh_lst: list,
             else:
                 s_sph = set_density(s_sph, sigma_s[:, :, 0], sigma_s[:, :, 1], sigma_s[:, :, 2])
                 trg = t_sph["Xcart"].reshape(-1, 3)
-                cross = Stk3d.bio_offsurf_apply(
-                    trg, s_sph, sh_lst[sind], sl_scal_lst[sind], dl_scal_lst[sind],
+                # cross = Stk3d.bio_offsurf_apply(
+                #     trg, s_sph, sh_lst[sind], sl_scal_lst[sind], dl_scal_lst[sind],
+                #     sep_mat[tind, sind] == 0)
+                cross = Stk3d.point_n_shoot(
+                    t_sph, sh_lst[tind], s_sph, sh_lst[sind], sl_scal_lst[sind], dl_scal_lst[sind],
                     sep_mat[tind, sind] == 0)
                 acc = acc + cross.reshape(-1)
 
