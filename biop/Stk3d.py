@@ -209,6 +209,46 @@ def Stk3d_dl_far(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     DL_sigma = prefac * jnp.sum(r * (rdotn * rdots / d ** 5 * wts[None, :])[..., None], axis=1)
     return DL_sigma
 
+@partial(jax.jit, static_argnames=["sh", "shtrg", "exterior"])
+def _stk_sl_1sph_kernel(Sigma: jax.Array, theta: jax.Array, phi: jax.Array,
+                        theta_trg: jax.Array, phi_trg: jax.Array, a: float, trg_dr: float,
+                        sh: shtns_jax.sht, shtrg: shtns_jax.sht, exterior: bool) -> jax.Array:
+    """Jitted core of Stk3d_sl_r_1sph. <exterior> (the trg_dr > a branch) and the
+    nlm pad/truncate are compile-time constants (static args)."""
+    vlm_sigma, wlm_sigma, xlm_sigma = sig_xyz2vwx(
+        Sigma[:, :, 0], Sigma[:, :, 1], Sigma[:, :, 2], theta, phi, sh)
+    rho = trg_dr / a          # solid harmonics evaluated as if src sphere were unit
+    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
+    diag_V, diag_W, diag_X = Stk3d_sl_VWX_diag(sh)
+
+    if exterior:
+        diag_W2V_ext = l_vals / (4.0*l_vals+2.0)
+        W2Vlm_SL_sigma_ext = (rho ** (-l_vals - 2.0) - rho ** (-l_vals)) * diag_W2V_ext * wlm_sigma
+        vlm_SL_sigma = rho ** (-l_vals-2.0) * diag_V * vlm_sigma + W2Vlm_SL_sigma_ext
+        wlm_SL_sigma = rho ** (-l_vals) * diag_W * wlm_sigma
+        xlm_SL_sigma = rho ** (-l_vals - 1.0) * diag_X * xlm_sigma
+    else:
+        diag_V2W_int = (l_vals+1.0) / (4.0*l_vals+2.0)
+        # rpowers_V2W_int has a typo in the paper; kept as previously verified.
+        V2Wlm_SL_sigma_int = (rho ** (l_vals+1.0) - rho ** (l_vals - 1.0)) * diag_V2W_int * vlm_sigma
+        vlm_SL_sigma = rho ** (l_vals+1.0) * diag_V * vlm_sigma
+        wlm_SL_sigma = rho ** (l_vals - 1.0) * diag_W * wlm_sigma + V2Wlm_SL_sigma_int
+        xlm_SL_sigma = rho ** (l_vals) * diag_X * xlm_sigma
+
+    # Interpolate to new grid by padding or truncating coefficients to Strg['lmax']
+    nlm_src = sh.nlm_cplx
+    nlm_trg = shtrg.nlm_cplx
+    if nlm_trg > nlm_src:
+        vlm_SL_sigma = jnp.pad(vlm_SL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+        wlm_SL_sigma = jnp.pad(wlm_SL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+        xlm_SL_sigma = jnp.pad(xlm_SL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+    elif nlm_trg < nlm_src:
+        vlm_SL_sigma = vlm_SL_sigma[:nlm_trg]
+        wlm_SL_sigma = wlm_SL_sigma[:nlm_trg]
+        xlm_SL_sigma = xlm_SL_sigma[:nlm_trg]
+    val_x, val_y, val_z = sig_vwx2xyz(vlm_SL_sigma, wlm_SL_sigma, xlm_SL_sigma, theta_trg, phi_trg, shtrg)
+    return a * jnp.stack([val_x, val_y, val_z], axis=2)   # SL scales by a
+
 def Stk3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
     Off-surface evaluation at a spherical grid of targets
@@ -223,61 +263,49 @@ def Stk3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: s
         print("Strg lmax does not match sht_trg's lmax, reform sht_trg.")
         shtrg = shtns_jax.sht(Strg["lmax"], Strg["lmax"])
 
-    Sigma_x = S["Sigma"][:,:,0] 
-    Sigma_y = S["Sigma"][:,:,1] 
-    Sigma_z = S["Sigma"][:,:,2] 
-    theta = S["Xsph"][:,:,0]
-    phi = S["Xsph"][:,:,1]
-    vlm_sigma, wlm_sigma, xlm_sigma = sig_xyz2vwx(Sigma_x, Sigma_y, Sigma_z, theta, phi, sh)
-    
-    trg_dr = Strg["r"]
-    a = S["r"]
+    exterior = bool(Strg["r"] > S["r"])
+    return _stk_sl_1sph_kernel(S["Sigma"], S["Xsph"][:, :, 0], S["Xsph"][:, :, 1],
+                               Strg["Xsph"][:, :, 0], Strg["Xsph"][:, :, 1],
+                               S["r"], Strg["r"], sh, shtrg, exterior)
+
+@partial(jax.jit, static_argnames=["sh", "shtrg", "exterior"])
+def _stk_dl_1sph_kernel(Sigma: jax.Array, theta: jax.Array, phi: jax.Array,
+                        theta_trg: jax.Array, phi_trg: jax.Array, a: float, trg_dr: float,
+                        sh: shtns_jax.sht, shtrg: shtns_jax.sht, exterior: bool) -> jax.Array:
+    """Jitted core of Stk3d_dl_r_1sph. <exterior> (the trg_dr > a branch) and the
+    nlm pad/truncate are compile-time constants (static args). DL is scale-invariant."""
+    vlm_sigma, wlm_sigma, xlm_sigma = sig_xyz2vwx(
+        Sigma[:, :, 0], Sigma[:, :, 1], Sigma[:, :, 2], theta, phi, sh)
     rho = trg_dr / a          # solid harmonics evaluated as if src sphere were unit
     l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
-    diag_V, diag_W, diag_X = Stk3d_sl_VWX_diag(sh)
-    rpowers_V_ext = rho ** (-l_vals-2.0)
-    rpowers_V_int = rho ** (l_vals+1.0)
-    vlm_SL_sigma_ext = rpowers_V_ext * diag_V * vlm_sigma
-    vlm_SL_sigma_int = rpowers_V_int * diag_V * vlm_sigma
+    diag_V_ext, diag_W_ext, diag_X_ext, diag_V_int, diag_W_int, diag_X_int = Stk3d_dl_VWX_diag(sh)
 
-    rpowers_W_ext = rho ** (-l_vals)
-    rpowers_W_int = rho ** (l_vals - 1.0)
-    wlm_SL_sigma_ext = rpowers_W_ext * diag_W * wlm_sigma
-    wlm_SL_sigma_int = rpowers_W_int * diag_W * wlm_sigma
+    if exterior:
+        diag_W2V_ext = 2. * l_vals * (l_vals - 1.0) / (4.0*l_vals+2.0)
+        W2Vlm_DL_sigma_ext = (rho ** (-l_vals - 2.0) - rho ** (-l_vals)) * diag_W2V_ext * wlm_sigma
+        vlm_DL_sigma = rho ** (- l_vals - 2.0) * diag_V_ext * vlm_sigma + W2Vlm_DL_sigma_ext
+        wlm_DL_sigma = rho ** (-l_vals) * diag_W_ext * wlm_sigma
+        xlm_DL_sigma = rho ** (-l_vals - 1.0) * diag_X_ext * xlm_sigma
+    else:
+        diag_V2W_int = (l_vals+1.0) * (l_vals + 2.0) / (2.0*l_vals+1.0)
+        V2Wlm_DL_sigma_int = (- rho ** (l_vals + 1.0) + rho ** (l_vals - 1.0)) * diag_V2W_int * vlm_sigma
+        vlm_DL_sigma = rho ** (l_vals + 1.0) * diag_V_int * vlm_sigma
+        wlm_DL_sigma = rho ** (l_vals - 1.0) * diag_W_int * wlm_sigma + V2Wlm_DL_sigma_int
+        xlm_DL_sigma = rho ** (l_vals) * diag_X_int * xlm_sigma
 
-    rpowers_X_ext = rho ** (-l_vals - 1.0)
-    rpowers_X_int = rho ** (l_vals)
-    xlm_SL_sigma_ext = rpowers_X_ext * diag_X * xlm_sigma
-    xlm_SL_sigma_int = rpowers_X_int * diag_X * xlm_sigma
-
-    diag_V2W_int = (l_vals+1.0) / (4.0*l_vals+2.0)
-    diag_W2V_ext = l_vals / (4.0*l_vals+2.0)
-    rpowers_V2W_int = rho ** (l_vals+1.0) - rho ** (l_vals - 1.0) # Note: TYPO IN PAPER
-    rpowers_W2V_ext = rho ** (-l_vals - 2.0) - rho ** (-l_vals)
-    V2Wlm_SL_sigma_int = rpowers_V2W_int * diag_V2W_int * vlm_sigma
-    W2Vlm_SL_sigma_ext = rpowers_W2V_ext * diag_W2V_ext * wlm_sigma
-
-    vlm_SL_sigma = vlm_SL_sigma_ext + W2Vlm_SL_sigma_ext if trg_dr > S['r'] else vlm_SL_sigma_int 
-    wlm_SL_sigma = wlm_SL_sigma_ext if trg_dr > S['r'] else wlm_SL_sigma_int + V2Wlm_SL_sigma_int
-    xlm_SL_sigma = xlm_SL_sigma_ext if trg_dr > S['r'] else xlm_SL_sigma_int
-
-    theta_trg = Strg["Xsph"][:,:,0]
-    phi_trg = Strg["Xsph"][:,:,1]
     # Interpolate to new grid by padding or truncating coefficients to Strg['lmax']
     nlm_src = sh.nlm_cplx
     nlm_trg = shtrg.nlm_cplx
     if nlm_trg > nlm_src:
-        vlm_SL_sigma = jnp.pad(vlm_SL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
-        wlm_SL_sigma = jnp.pad(wlm_SL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
-        xlm_SL_sigma = jnp.pad(xlm_SL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+        vlm_DL_sigma = jnp.pad(vlm_DL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+        wlm_DL_sigma = jnp.pad(wlm_DL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+        xlm_DL_sigma = jnp.pad(xlm_DL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
     elif nlm_trg < nlm_src:
-        vlm_SL_sigma = vlm_SL_sigma[:nlm_trg]
-        wlm_SL_sigma = wlm_SL_sigma[:nlm_trg]
-        xlm_SL_sigma = xlm_SL_sigma[:nlm_trg]
-    val_x, val_y, val_z = sig_vwx2xyz(vlm_SL_sigma, wlm_SL_sigma, xlm_SL_sigma, theta_trg, phi_trg, shtrg)
-    SL_sigma = a * jnp.stack([val_x, val_y, val_z], axis=2)   # SL scales by a
-
-    return SL_sigma
+        vlm_DL_sigma = vlm_DL_sigma[:nlm_trg]
+        wlm_DL_sigma = wlm_DL_sigma[:nlm_trg]
+        xlm_DL_sigma = xlm_DL_sigma[:nlm_trg]
+    val_x, val_y, val_z = sig_vwx2xyz(vlm_DL_sigma, wlm_DL_sigma, xlm_DL_sigma, theta_trg, phi_trg, shtrg)
+    return jnp.stack([val_x, val_y, val_z], axis=2)
 
 def Stk3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
@@ -293,62 +321,10 @@ def Stk3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: s
         print("Strg lmax does not match sht_trg's lmax, reform sht_trg.")
         shtrg = shtns_jax.sht(Strg["lmax"], Strg["lmax"])
 
-    Sigma_x = S["Sigma"][:,:,0] 
-    Sigma_y = S["Sigma"][:,:,1] 
-    Sigma_z = S["Sigma"][:,:,2] 
-    theta = S["Xsph"][:,:,0]
-    phi = S["Xsph"][:,:,1]
-    vlm_sigma, wlm_sigma, xlm_sigma = sig_xyz2vwx(Sigma_x, Sigma_y, Sigma_z, theta, phi, sh)
-
-    trg_dr = Strg["r"]
-    a = S["r"]
-    rho = trg_dr / a          # solid harmonics evaluated as if src sphere were unit
-    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
-    diag_V_ext, diag_W_ext, diag_X_ext, diag_V_int, diag_W_int, diag_X_int = Stk3d_dl_VWX_diag(sh)
-
-    rpowers_V_ext = rho ** (- l_vals - 2.0)
-    rpowers_V_int = rho ** (l_vals + 1.0)
-    vlm_DL_sigma_ext = rpowers_V_ext * diag_V_ext * vlm_sigma
-    vlm_DL_sigma_int = rpowers_V_int * diag_V_int * vlm_sigma
-
-    rpowers_W_ext = rho ** (-l_vals)
-    rpowers_W_int = rho ** (l_vals - 1.0)
-    wlm_DL_sigma_ext = rpowers_W_ext * diag_W_ext * wlm_sigma
-    wlm_DL_sigma_int = rpowers_W_int * diag_W_int * wlm_sigma
-
-    rpowers_X_ext = rho ** (-l_vals - 1.0)
-    rpowers_X_int = rho ** (l_vals)
-    xlm_DL_sigma_ext = rpowers_X_ext * diag_X_ext * xlm_sigma
-    xlm_DL_sigma_int = rpowers_X_int * diag_X_int * xlm_sigma
-
-    diag_V2W_int = (l_vals+1.0) * (l_vals + 2.0) / (2.0*l_vals+1.0)
-    diag_W2V_ext = 2. * l_vals * (l_vals - 1.0) / (4.0*l_vals+2.0)
-    rpowers_V2W_int = - rho ** (l_vals + 1.0) + rho ** (l_vals - 1.0)
-    rpowers_W2V_ext = rho ** (-l_vals - 2.0) - rho ** (-l_vals)
-    V2Wlm_DL_sigma_int = rpowers_V2W_int * diag_V2W_int * vlm_sigma
-    W2Vlm_DL_sigma_ext = rpowers_W2V_ext * diag_W2V_ext * wlm_sigma
-
-    vlm_DL_sigma = vlm_DL_sigma_ext + W2Vlm_DL_sigma_ext if trg_dr > S['r'] else vlm_DL_sigma_int
-    wlm_DL_sigma = wlm_DL_sigma_ext if trg_dr > S['r'] else wlm_DL_sigma_int + V2Wlm_DL_sigma_int
-    xlm_DL_sigma = xlm_DL_sigma_ext if trg_dr > S['r'] else xlm_DL_sigma_int
-
-    theta_trg = Strg["Xsph"][:,:,0]
-    phi_trg = Strg["Xsph"][:,:,1]
-    # Interpolate to new grid by padding or truncating coefficients to Strg['lmax']
-    nlm_src = sh.nlm_cplx
-    nlm_trg = shtrg.nlm_cplx
-    if nlm_trg > nlm_src:
-        vlm_DL_sigma = jnp.pad(vlm_DL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
-        wlm_DL_sigma = jnp.pad(wlm_DL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
-        xlm_DL_sigma = jnp.pad(xlm_DL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
-    elif nlm_trg < nlm_src:
-        vlm_DL_sigma = vlm_DL_sigma[:nlm_trg]
-        wlm_DL_sigma = wlm_DL_sigma[:nlm_trg]
-        xlm_DL_sigma = xlm_DL_sigma[:nlm_trg]
-    val_x, val_y, val_z = sig_vwx2xyz(vlm_DL_sigma, wlm_DL_sigma, xlm_DL_sigma, theta_trg, phi_trg, shtrg)
-    DL_sigma = jnp.stack([val_x, val_y, val_z], axis=2)
-
-    return DL_sigma
+    exterior = bool(Strg["r"] > S["r"])
+    return _stk_dl_1sph_kernel(S["Sigma"], S["Xsph"][:, :, 0], S["Xsph"][:, :, 1],
+                               Strg["Xsph"][:, :, 0], Strg["Xsph"][:, :, 1],
+                               S["r"], Strg["r"], sh, shtrg, exterior)
 
 def _stk_trg_sph(trg: jax.Array, S: SphereDict) -> tuple([jax.Array, jax.Array, jax.Array]):
     """Spherical coordinates (dr, theta, phi) of targets <trg> relative to S["Xc"]."""
@@ -495,6 +471,7 @@ def bio_offsurf_apply(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht, sl_scal:
     Ksigma = sl_scal * SLsigma + dl_scal * DLsigma
     return Ksigma
 
+@partial(jax.jit, static_argnames=["sh"])
 def bio_onsurf_apply(sigma_tens: jax.Array, theta: jax.Array, phi: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0., radius: float = 1.0) -> jax.Array:
     """
     Apply the combined DL potential operator K = sl_scal * SL + dl_scal * DL
@@ -536,6 +513,7 @@ def bio_onsurf_apply(sigma_tens: jax.Array, theta: jax.Array, phi: jax.Array, sh
 
     return V
 
+@partial(jax.jit, static_argnames=["sh"])
 def stokes_onsurf_direct_solve(bc_vec: jax.Array, theta: jax.Array, phi: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0., radius: float = 1.0) -> jax.Array:
     """
     Directly solves the Stokes BIO equation using the VWX diagonal property.

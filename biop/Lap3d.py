@@ -272,6 +272,28 @@ def Lap3d_dsl(trg: jax.Array, trgN: jax.Array, S: SphereDict, sh: shtns_jax.sht)
 
     return T_sigma
 
+@partial(jax.jit, static_argnames=["sh", "shtrg", "exterior"])
+def _lap_sl_1sph_kernel(Sigma: jax.Array, a: float, trg_dr: float,
+                        sh: shtns_jax.sht, shtrg: shtns_jax.sht, exterior: bool) -> jax.Array:
+    """Jitted core of Lap3d_sl_r_1sph. <exterior> (the trg_dr > a branch) and the
+    nlm pad/truncate are compile-time constants (static args)."""
+    qlm_sigma = sh.analys_cplx_jax(Sigma)
+    rho = trg_dr / a          # solid harmonics as if src sphere were unit; SL scales by a
+    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
+    diag = Lap3d_sl_diag(sh)
+    rpowers = rho ** (-l_vals - 1) if exterior else rho ** (l_vals)
+    qlm_SL_sigma = a * rpowers * qlm_sigma * diag
+
+    # Interpolate to new grid by padding or truncating coefficients to Strg['lmax']
+    nlm_src = sh.nlm_cplx
+    nlm_trg = shtrg.nlm_cplx
+    if nlm_trg > nlm_src:
+        qlm_SL_sigma = jnp.pad(qlm_SL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+    elif nlm_trg < nlm_src:
+        qlm_SL_sigma = qlm_SL_sigma[:nlm_trg]
+
+    return shtrg.synth_cplx_jax(qlm_SL_sigma)
+
 def Lap3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
     Off-surface evaluation at a spherical grid of targets
@@ -286,33 +308,32 @@ def Lap3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: s
         print("Strg lmax does not match sht_trg's lmax, reform sht_trg.")
         shtrg = shtns_jax.sht(Strg["lmax"], Strg["lmax"])
 
-    Sigma = S["Sigma"][:,:,0] 
-    qlm_sigma = sh.analys_cplx_jax(Sigma)
+    exterior = bool(Strg["r"] > S["r"])
+    return _lap_sl_1sph_kernel(S["Sigma"][:, :, 0], S["r"], Strg["r"], sh, shtrg, exterior)
 
-    trg_dr = Strg["r"]
-    a = S['r']
-    rho = trg_dr / a          # solid harmonics as if src sphere were unit; SL scales by a
+@partial(jax.jit, static_argnames=["sh", "shtrg", "exterior"])
+def _lap_dl_1sph_kernel(Sigma: jax.Array, a: float, trg_dr: float,
+                        sh: shtns_jax.sht, shtrg: shtns_jax.sht, exterior: bool) -> jax.Array:
+    """Jitted core of Lap3d_dl_r_1sph. <exterior> (the trg_dr > a branch) and the
+    nlm pad/truncate are compile-time constants (static args)."""
+    qlm_sigma = sh.analys_cplx_jax(Sigma)
+    rho = trg_dr / a          # solid harmonics as if src sphere were unit; DL is scale-invariant
     l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
-    diag = Lap3d_sl_diag(sh)
-    rpowers_ext = rho ** (-l_vals-1)
-    rpowers_int = rho ** (l_vals)
-    qlm_SL_sigma_ext = a * rpowers_ext * qlm_sigma * diag
-    qlm_SL_sigma_int = a * rpowers_int * qlm_sigma * diag
-    qlm_SL_sigma = qlm_SL_sigma_ext if trg_dr > a else qlm_SL_sigma_int
+    [diag_ext, diag_int] = Lap3d_dl_diag(sh)
+    if exterior:
+        qlm_DL_sigma = (rho ** (-l_vals - 1)) * qlm_sigma * diag_ext
+    else:
+        qlm_DL_sigma = (rho ** (l_vals)) * qlm_sigma * diag_int
 
     # Interpolate to new grid by padding or truncating coefficients to Strg['lmax']
     nlm_src = sh.nlm_cplx
     nlm_trg = shtrg.nlm_cplx
     if nlm_trg > nlm_src:
-        qlm_SL_sigma = jnp.pad(qlm_SL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
+        qlm_DL_sigma = jnp.pad(qlm_DL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
     elif nlm_trg < nlm_src:
-        qlm_SL_sigma = qlm_SL_sigma[:nlm_trg]
+        qlm_DL_sigma = qlm_DL_sigma[:nlm_trg]
 
-    theta_trg = Strg["Xsph"][:,:,0]
-    phi_trg = Strg["Xsph"][:,:,1]
-    SL_sigma = shtrg.synth_cplx_jax(qlm_SL_sigma)
-
-    return SL_sigma
+    return shtrg.synth_cplx_jax(qlm_DL_sigma)
 
 def Lap3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
@@ -328,33 +349,8 @@ def Lap3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: s
         print("Strg lmax does not match sht_trg's lmax, reform sht_trg.")
         shtrg = shtns_jax.sht(Strg["lmax"], Strg["lmax"])
 
-    Sigma = S["Sigma"][:,:,0] 
-    qlm_sigma = sh.analys_cplx_jax(Sigma)
-
-    trg_dr = Strg["r"]
-    a = S['r']
-    rho = trg_dr / a          # solid harmonics as if src sphere were unit; DL is scale-invariant
-    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
-    [diag_ext, diag_int] = Lap3d_dl_diag(sh)
-    rpowers_ext = rho ** (-l_vals-1)
-    rpowers_int = rho ** (l_vals)
-    qlm_DL_sigma_ext = rpowers_ext * qlm_sigma * diag_ext
-    qlm_DL_sigma_int = rpowers_int * qlm_sigma * diag_int
-    qlm_DL_sigma = qlm_DL_sigma_ext if trg_dr > a else qlm_DL_sigma_int
-
-    # Interpolate to new grid by padding or truncating coefficients to Strg['lmax']
-    nlm_src = sh.nlm_cplx
-    nlm_trg = shtrg.nlm_cplx
-    if nlm_trg > nlm_src:
-        qlm_DL_sigma = jnp.pad(qlm_DL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
-    elif nlm_trg < nlm_src:
-        qlm_DL_sigma = qlm_DL_sigma[:nlm_trg]
-
-    theta_trg = Strg["Xsph"][:,:,0]
-    phi_trg = Strg["Xsph"][:,:,1]
-    DL_sigma = shtrg.synth_cplx_jax(qlm_DL_sigma)
-
-    return DL_sigma
+    exterior = bool(Strg["r"] > S["r"])
+    return _lap_dl_1sph_kernel(S["Sigma"][:, :, 0], S["r"], Strg["r"], sh, shtrg, exterior)
 
 def compute_potential(trg: jax.Array, src: jax.Array, force: jax.Array) -> jax.Array:
     """
