@@ -22,6 +22,10 @@ import argparse
 import os
 import sys
 
+# os.environ["XLA_FLAGS"] = (
+#     "--xla_cpu_multi_thread_eigen=true "
+# )
+
 import numpy as np
 
 # Put the repo root on the path so `import suspension` (and the modules it pulls in) resolve.
@@ -106,9 +110,9 @@ def main():
     bc = bc.at[3 * int(dsp[0]):3 * int(dsp[1])].set(bc_cont.reshape(-1))
 
     # --- Coupled solve ---
-    # TODO: add callback and norm to print residual at each iteration.
-    sigma, info, resid = susp.Stk3d_onsurf_solve(bc, Sp, sh_lst, sl_lst, dl_lst, sgn_lst, args.tol)
-    print(f"GMRES info (0 == converged): {info}, residual = {resid:.3e}")
+    Nnodes = dsp[-1].item()
+    sigma, t_solve, niter, info, resid = susp.Stk3d_onsurf_solve_spla(bc, Sp, Sp["Ns"], Nnodes, sh_lst, sl_lst, dl_lst, sgn_lst, args.tol)
+    print(f"GMRES info (0 == converged): {info}, time for solve is {t_solve}s, num of iters is {niter}, residual = {resid:.3e}")
 
     # --- Volumetric velocity field: interior to container, exterior to every obstacle ---
     trg_data = vtk_export.grid_from_spheres(Sp, args.Ng, pad=0.001)
