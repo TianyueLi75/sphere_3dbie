@@ -29,13 +29,16 @@ def test(lmax: int, exterior: bool = True):
     sl_scal = 1.0
     dl_scal = 1.0
     
+    # Non-concentric target sphere so point_n_shoot (to_lat_jax) applies.
     if exterior:
-        Rtrg = radius * 1.025
-        sgn = 1.0 
+        trg_center = jnp.array([3.,0.,0.])   # wholly exterior to S (d - Rtrg = 2 > a = 1)
+        Rtrg = radius
+        sgn = 1.0
     else:
-        Rtrg = radius * 0.975
-        sgn = -1.0 
-    Strg = build_sphere(center, Rtrg)
+        trg_center = jnp.array([0.2,0.,0.])  # wholly interior to S (d + Rtrg = 0.7 < a = 1)
+        Rtrg = radius * 0.5
+        sgn = -1.0
+    Strg = build_sphere(trg_center, Rtrg)
     lmax_trg = 40 # Fix target size
     Strg, shtrg = quadr_sphere(Strg, lmax_trg)
 
@@ -77,10 +80,10 @@ def test(lmax: int, exterior: bool = True):
     true_field = jnp.real(true_field)
 
     S = set_density(S, sig_direct[:,:,0], sig_direct[:,:,1], sig_direct[:,:,2])
-    Ksig_direct = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)  # warmup
+    Ksig_direct = point_n_shoot(Strg, shtrg, S, sh, sl_scal, dl_scal)  # warmup
     jax.block_until_ready(Ksig_direct)
     tstart = time.time()
-    Ksig_direct = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
+    Ksig_direct = point_n_shoot(Strg, shtrg, S, sh, sl_scal, dl_scal)
     jax.block_until_ready(Ksig_direct)
     tend = time.time()
     time_eval = tend - tstart

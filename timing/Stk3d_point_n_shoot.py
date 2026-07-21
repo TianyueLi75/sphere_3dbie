@@ -64,15 +64,20 @@ def test(lmax, src_c=(0., 0., 0.), src_r=1.0, trg_c=(3.0, 0., 0.), trg_r=0.5, se
     return t_pns, t_base, t_far, err_pns, err_far
 
 
-def plot_timing(lmax_list, t_pns, t_base, t_far, err_pns, title, path):
+def plot_timing_convergence(lmax_list, t_pns, t_base, t_far, err_pns, title, path):
+    """Combined loglog figure: timing of each evaluator on the left axis, the
+    point-and-shoot relative error (vs the exact single-point baseline) on the
+    right axis, sharing a log lmax axis."""
     fig, ax1 = plt.subplots()
     l1 = ax1.loglog(lmax_list, t_pns, 'bo-', label="point-and-shoot")
     l2 = ax1.loglog(lmax_list, t_base, 'k+-', label="single-point eval")
     l3 = ax1.loglog(lmax_list, t_far, 'gs-', label="far quadrature")
     ax1.set_xlabel("lmax"); ax1.set_ylabel("Time (s)")
+
     ax2 = ax1.twinx()
     l4 = ax2.loglog(lmax_list, err_pns, 'r*--', label="rel err (P&S vs single-pt)")
-    ax2.set_ylabel("max relative error")
+    ax2.set_ylabel("max relative error vs single-point eval")
+
     lines = l1 + l2 + l3 + l4
     ax1.legend(lines, [ln.get_label() for ln in lines], loc="upper left", fontsize=8)
     ax1.set_title(title)
@@ -98,7 +103,7 @@ if __name__ == "__main__":
         print(f"{lmax:>5d} {ep:>11.3e} {ef:>11.3e} {tp:>10.4f} {tb:>10.4f} {tf:>10.4f} "
               f"{tb/tp:>7.1f}x", flush=True)
 
-    plot_timing(lmax_list, Tpns, Tbase, Tfar, Epns,
-                "Stokes sphere-to-sphere: point-and-shoot vs single-point eval",
-                os.path.join(here, "plots", "Stk3d_point_n_shoot.svg"))
+    plot_timing_convergence(lmax_list, Tpns, Tbase, Tfar, Epns,
+                            "Stokes sphere-to-sphere: point-and-shoot vs single-point eval",
+                            os.path.join(here, "plots", "Stk3d_point_n_shoot.svg"))
     print("Wrote plots/Stk3d_point_n_shoot.svg to", here)
