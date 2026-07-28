@@ -48,7 +48,8 @@ def test(lmax: int, chk: jax.Array):
     # Fixed problem geometry / parameters (matches suspension.py TEST 3).
     CENTERS = jnp.array([[0., 0., 0.], [0.3, 0.1, -0.05]])
     RADII = jnp.array([1.0, 0.2])
-    SEP_ETA = 0.1
+    # SEP_ETA = 0.001 # all far
+    SEP_ETA = 100 # all near
     SL_SCAL = 1.0
     DL_SCAL = 1.0
     SGN_LST = [-1.0, 1.0]   # interior container, exterior obstacle
@@ -57,7 +58,8 @@ def test(lmax: int, chk: jax.Array):
 
     """One run at resolution <lmax>; returns timings + the velocity at fixed points <chk>."""
     Sp = build_suspension(CENTERS, RADII, SEP_ETA)
-    Sp, sh_lst = quadr_suspension(Sp, jnp.array([lmax, lmax]))
+    # Sp, sh_lst = quadr_suspension(Sp, jnp.array([lmax, lmax]))
+    Sp, sh_lst = quadr_suspension(Sp, jnp.array([lmax, 36]))
     Ns = Sp["Ns"]
     sl_lst = [SL_SCAL] * Ns
     dl_lst = [DL_SCAL] * Ns
@@ -74,9 +76,9 @@ def test(lmax: int, chk: jax.Array):
 
     # Warmup: compile the jitted self-block / preconditioner kernels for this lmax's shapes
     # with a single (untimed) GMRES iteration, so they are excluded from the timed solve.
-    Stk3d_onsurf_solve(bc, Sp, Ns, Nnodes, sh_lst, sl_lst, dl_lst, SGN_LST, maxiter=1)
+    Stk3d_onsurf_solve_spla(bc, Sp, Ns, Nnodes, sh_lst, sl_lst, dl_lst, SGN_LST, maxiter=1)
 
-    sigma, t_solve, iters, info, resid = Stk3d_onsurf_solve(bc, Sp, Ns, Nnodes, sh_lst, sl_lst, dl_lst, SGN_LST)
+    sigma, t_solve, iters, info, resid = Stk3d_onsurf_solve_spla(bc, Sp, Ns, Nnodes, sh_lst, sl_lst, dl_lst, SGN_LST)
 
     # Time the off-surface field evaluation at the fixed check points.
     t0 = time.time()
@@ -137,7 +139,7 @@ def make_check_points(n=64, seed=0):
 
 
 if __name__ == "__main__":
-    lmax_list = [2**n for n in range(2, 10)]
+    lmax_list = [2**n for n in range(2,10)]
     # lmax_list = [2**n for n in range(2, 5)]
     chk = make_check_points()
 
@@ -163,15 +165,16 @@ if __name__ == "__main__":
     for i in range(len(lmax_list) - 1):
         print(f"  lmax={lmax_list[i]:>3d}: max rel diff = {err[i]:.3e}")
 
-    here = os.path.dirname(os.path.abspath(__file__))
+    # here = os.path.dirname(os.path.abspath(__file__))
 
-    plot_timing_convergence(lmax_list, t_periter_solve, t_eval, err,
-                            "Container-obstacle Stokes: timing + self-convergence",
-                            os.path.join(here, "./plots/Stk3d_container_obstacle.svg"))
-    print("\nWrote Stk3d_container_obstacle.svg to", here)
+    # plot_timing_convergence(lmax_list, t_periter_solve, t_eval, err,
+    #                         "Container-obstacle Stokes: timing + self-convergence",
+    #                         os.path.join(here, "./plots/Stk3d_container_obstacle.svg"))
+    # print("\nWrote Stk3d_container_obstacle.svg to", here)
 
 
     '''
+ OLD results, solve in physical domain, spla solve, near-far split by eta=0.1 (or 0.01?), precond on all but container:
  lmax  info  iters     residual   t_solve(s)    t/iter(s)    t_eval(s)
     4     0      4    2.155e-14        0.045 0.0111619234085083        3.113
     8     0      4    1.616e-14        0.099 0.024657130241394043        2.175
@@ -190,4 +193,59 @@ if __name__ == "__main__":
   lmax= 64: max rel diff = 4.115e-15
   lmax=128: max rel diff = 2.297e-15
   lmax=256: max rel diff = 2.144e-15
+
+  VARYING CONTAINER LMAX ONLY:
+  New results, solve in spectral domain, spla solve, all near (point and shoot) precond on all:
+  lmax  info  iters     residual   t_solve(s)    t/iter(s)    t_eval(s)
+  starting lmax=4
+    4     0     13    8.454e-12        0.162 0.012494160578801082        6.538
+  starting lmax=8
+    8     0     13    9.904e-12        0.152 0.011706388913668118        2.850 
+  starting lmax=16
+   16     0     13    9.906e-12        0.202 0.015557655921349159        2.853 
+  starting lmax=32
+   32     0     13    9.906e-12        0.170 0.01307819439814641        3.568
+  starting lmax=64
+   64     0     13    9.906e-12        0.755 0.05805136607243465        3.161
+  starting lmax=128
+  128     0     13    9.906e-12        3.831 0.29466893122746396        2.073
+  starting lmax=256
+   256     0     13    9.906e-12       52.366 4.0281713008880615        4.569
+  starting lmax=512
+  512     0     13    9.906e-12      173.629 13.35610162294828        7.382
+
+
+  New results, solve in spectral domain, spla solve, all near, no precond on container -- net loss.
+  lmax  info  iters     residual   t_solve(s)    t/iter(s)    t_eval(s)
+  starting lmax=4
+    4     0     18    8.374e-11        0.194 0.010773420333862305        4.512
+  starting lmax=8
+    8     0     23    1.648e-11        0.212 0.009196737538213316        1.873
+  starting lmax=16
+   16     0     23    1.654e-11        0.222 0.009660814119421917        1.981
+  starting lmax=32
+   32     0     23    1.654e-11        0.222 0.009649991989135742        2.027
+  starting lmax=64
+   64     0     23    1.654e-11        1.016 0.0441615166871444        1.979
+  starting lmax=128
+  128     0     23    1.654e-11        7.166 0.3115802225859269        2.171
+  starting lmax=256
+  256     0     23    1.654e-11       54.752 2.380502141040304        2.603
+  starting lmax=512
+  512     0     23    1.654e-11      309.391 13.451793867608774        7.252
+
+  solve in spectral domian, lineax, all near, no precond on container (much slower)
+  lmax  info  iters     residual   t_solve(s)    t/iter(s)    t_eval(s)
+  starting lmax=4
+    4     0      4    4.543e-16        0.633 0.15834492444992065        1.325
+  starting lmax=8
+    8     0      4    4.413e-16        0.665 0.16630232334136963        0.278
+  starting lmax=16
+   16     0      4    2.511e-16        0.679 0.16972488164901733        0.299
+  starting lmax=32
+   32     0      4    2.843e-16        0.838 0.20960330963134766        0.314
+  starting lmax=64
+   64     0      4    3.180e-16        3.525 0.8812769055366516        0.399
+  starting lmax=128
+
     '''

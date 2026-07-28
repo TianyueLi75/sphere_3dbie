@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from suspension import build_suspension, quadr_suspension, Stk3d_onsurf_solve
+from suspension import build_suspension, quadr_suspension, Stk3d_onsurf_solve_spla
 from sphere import set_density
 from biop import Stk3d
 
@@ -93,7 +93,10 @@ def test(lmax: int, chk: jax.Array, mode: str):
     """One run at resolution <lmax> (uniform on all spheres); returns timings + the
     velocity at fixed points <chk>."""
     Sp = build_suspension(CENTERS, RADII, SEP_ETA)
-    Sp, sh_lst = quadr_suspension(Sp, jnp.full((NS,), lmax))
+    # lmax_lst = jnp.full((NS,), lmax)
+    lmax_lst = 36 * jnp.ones((NS,))
+    lmax_lst = lmax_lst.at[0].set(lmax) # Small interior obstacle lmax, large container lmax.
+    Sp, sh_lst = quadr_suspension(Sp, lmax_lst)
     Ns = Sp["Ns"]
     sl_lst = [SL_SCAL] * Ns
     dl_lst = [DL_SCAL] * Ns
@@ -104,9 +107,9 @@ def test(lmax: int, chk: jax.Array, mode: str):
 
     # Warmup: compile the jitted self-block / preconditioner kernels for this lmax's shapes
     # with a single (untimed) GMRES iteration, so they are excluded from the timed solve.
-    Stk3d_onsurf_solve(bc, Sp, Ns, Nnodes, sh_lst, sl_lst, dl_lst, SGN_LST, maxiter=1)
+    Stk3d_onsurf_solve_spla(bc, Sp, Ns, Nnodes, sh_lst, sl_lst, dl_lst, SGN_LST, maxiter=1)
 
-    sigma, t_solve, iters, info, resid = Stk3d_onsurf_solve(bc, Sp, Ns, Nnodes, sh_lst, sl_lst, dl_lst, SGN_LST)
+    sigma, t_solve, iters, info, resid = Stk3d_onsurf_solve_spla(bc, Sp, Ns, Nnodes, sh_lst, sl_lst, dl_lst, SGN_LST)
 
     # Time the off-surface field evaluation at the fixed check points.
     t0 = time.time()
@@ -223,36 +226,46 @@ def run(mode, chk, lmax_list):
 
 
 if __name__ == "__main__":
-    lmax_list = [2 ** n for n in range(2, 9)]   # [4, 8, 16, 32, 64, 128, 256]
+    lmax_list = [2 ** n for n in range(5, 13)]   
     chk = make_check_points()
     print(f"{chk.shape[0]} interior check points; {NS} spheres "
           f"(container R={_R}, {NS - 1} obstacles r={_r}).", flush=True)
 
-    run("obstacles", chk, lmax_list)
     run("container", chk, lmax_list)
 
 
 '''
-Partial results (CPU, OMP_NUM_THREADS=1), BC mode "obstacles", captured through lmax=128.
-lmax=256 was not run: extrapolating the per-iter ratios below it is ~1.5-2 days for that
-single point (the far direct sum enters an O(lmax^4) regime). The 128 point already took
-~4 hours; 256 is left in the default sweep as the production target to run when convenient.
+Full results (CPU, OMP_NUM_THREADS=1), SEP_ETA=100 so every cross pair uses point-and-shoot
+(O(lmax^3)) and the O(lmax^4) direct far sum is disabled. Both BC modes, full lmax sweep. LINEAX here.
 
+BC mode "container" (squirmer slip on the container, no-slip obstacles):
  lmax  info  iters     residual   t_solve(s)    t/iter(s)    t_eval(s)
-    4     1      6    3.722e-03        1.080       0.1801        2.851
-    8     1      6    2.082e-05        3.457       0.5762        1.988
-   16     1      6    1.495e-08       17.308       2.8847        2.208
-   32     0      6    3.391e-14       97.404      16.2340        2.413
-   64     0      6    3.107e-14     1015.776     169.2959        2.692
-  128     0      6    4.057e-14    12705.005    2117.5008        4.755
+    4     0      5    4.348e-14        0.206       0.0411        0.417
+    8     0      5    5.123e-14        0.422       0.0844        0.449
+   16     0      6    5.413e-14        1.059       0.1765        0.525
+   32     0      6    4.929e-14        3.764       0.6273        0.691
+   64     0      6    4.563e-14       21.689       3.6149        0.969
+  128     0      6    5.112e-14      198.281      33.0469        3.015
+  256     0      6    5.561e-14     2161.990     360.3317       15.529
+  self-convergence vs lmax=256: 4:4.5e-1 8:3.5e-2 16:6.3e-5 32:1.7e-9 64:5.5e-15 128:5.9e-15
+  per-iter fit (lmax>=32) exponent = 3.07; t/iter ratios 2.1 2.1 3.6 5.8 9.1 10.9
 
-Observations:
-  - GMRES iteration count is constant (6) across lmax: conditioning is lmax-independent for
-    this well-separated geometry, so the cost growth is entirely in time-per-iteration.
-  - The residual floor is set by the point-and-shoot near-eval accuracy: info=1 (tol not
-    reached) below lmax=32, then machine precision (~1e-14) from lmax=32 on. Self-convergence
-    of the interior velocity field is likewise saturated by lmax=32.
-  - Per-iter t/iter doubling ratios: 3.2, 5.0, 5.6, 10.4, 12.5. A log-log fit over
-    lmax in [32,128] gives exponent ~3.5: ~O(lmax^3) in the mid-range, bending toward
-    O(lmax^4) at high lmax as the far direct sum dominates.
+
+ "Container" BVP
+ Full results (CPU, 1 thread), sep_eta=0.1 for both near and direct. 
+ Solved in spectral space AND speed up in direct eval.
+ Fix obstacle lmax=36, increase container lmax only. SPLA
+   lmax  info  iters     residual   t_solve(s)    t/iter(s)    t_eval(s)
+  ... starting lmax=32
+   32     0     40    8.771e-11       11.347       0.2837        1.744
+  ... starting lmax=64
+  60      0     40    8.771e-11       17.613       0.4403        0.816
+  ... starting lmax=128
+  128     0     40    8.771e-11       48.925       1.2231        1.116
+  ... starting lmax=256
+  256     0     40    8.771e-11      207.730       5.1932        2.324
+  ... starting lmax=512
+  512     0     40    8.771e-11      803.220      20.0805        7.954
+  ... starting lmax=1024
+  1024     0     40    8.771e-11     3585.076      89.6269       28.885
 '''
