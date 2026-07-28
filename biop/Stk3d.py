@@ -3,6 +3,8 @@ Stokes Operator Class:
     SL and DL operators on a sphere, using spectra and solid harmonics
     TODO:
         Made SHqst_to_point_cplx using np locally in this script -- need to incorporate into SHTns and have jax wrap
+            (a BATCHED form -- (Ntrg, nlm) coefficient blocks, loop inside -- is what the near
+             eval wants: every target carries its own scaled coefficients. See _stk_near.)
         Allow on-surface evaluation in bio_offsurf_apply()
         onsurf_diag_solve() l=0 currently set to BC values. Throw exception instead?
         SL traction near and far off-surface eval.
@@ -116,6 +118,11 @@ def sig_vwx2xyz(vlm: jax.Array, wlm: jax.Array, xlm: jax.Array, theta: jax.Array
     vx, vy, vz = sph2cart(vr, vt, vp, theta, phi)
     return vx, vy, vz
 
+
+
+# ============================
+# === Spectra ================
+# ============================
 def Stk3d_sl_VWX_diag(sh: shtns_jax.sht) -> tuple([jax.Array, jax.Array, jax.Array]):
     l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
     diag_V = l_vals / (2.0*l_vals + 1.0) / (2.0*l_vals + 3.0)
@@ -157,66 +164,138 @@ def diag_V2W(sh: shtns_jax.sht, which: str) -> jax.Array:
         return (l_vals + 1.0) / (4.0*l_vals + 2.0)
     return (l_vals + 1.0)*(l_vals + 2.0) / (2.0*l_vals + 1.0)      # dl
 
-def Stk3d_sl_far(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
+
+
+# ============================
+# === Operators ==============
+# === In spectral domain =====
+# ============================
+
+STK_SL_FAR_PREFAC = 1.0 / 8.0 / jnp.pi
+STK_DL_FAR_PREFAC = 6.0 / 8.0 / jnp.pi
+
+@partial(jax.jit, static_argnames=["sh", "tile", "terms"])
+def _stk_far_kernel(trg: jax.Array, sig_vwx: jax.Array, sl_scal, dl_scal,
+                    Y: jax.Array, w: jax.Array, a, Xc: jax.Array,
+                    th: jax.Array, ph: jax.Array,
+                    sh: shtns_jax.sht, tile: int, terms: tuple) -> jax.Array:
+    """
+    Fused smooth-quadrature ("far") evaluation of  K = sl*SL + dl*DL  (Stokeslet + stresslet)
+    of the source sphere described by <Y>, <w>, <a>, <Xc> (see sphere.far_src_geom) with
+    vector density VWX coefficients <sig_vwx> ((3, nlm)), at targets <trg> (Ntrg x 3).
+    Returns the velocity: Ntrg x 3.  <terms> selects which operators are built (static, so
+    the SL-only / DL-only wrappers pay nothing for the other); the scalings stay traced.
+
+    With x_i = trg_i - Xc, r = x_i - Y_j, g_j = w_j sigma_j and n_j = Y_j/a exactly (sphere),
+        d2 = |x_i|^2 - 2 x_i.Y_j + a^2,   r.n_j = (|x_i|^2 - a^2 - d2)/(2a)
+    so the stresslet's radial factor collapses to
+        M_ij = invd5*(r.n) = [ (|x_i|^2 - a^2) invd5 - invd3 ] / (2a)
+    and, with  coef = sl*pref_sl*invd3 + dl*pref_dl*M,  both operators share ONE pair matrix:
+        u_i = sl*pref_sl * sum_j invd g_j  +  sum_j coef_ij (r.g_j) r
+    Expanding r.g_j = x_i.g_j - Y_j.g_j and r = x_i - Y_j turns the second sum into
+    contractions of <coef> against source-only column blocks (g_j, Y_j.g_j, g_j (x) Y_j,
+    (Y_j.g_j) Y_j), reassembled with the per-target factor x_i. So NO pair-shaped array
+    depends on the density: only invd and coef are Ntrg x Nsrc, and both are REAL. That
+    removes the two 3-wide complex Ntrg x Nsrc x 3 temporaries, all complex pair arithmetic,
+    and the ~10 divisions per pair of the previous formulation (one rsqrt remains; note the
+    old d**3 / d**5 were already lowered to multiplies, so it is the divisions and the pair
+    traffic that cost, not pow()).
+    Measured ~12-19x faster per call than the previous per-operator kernels (lmax 32-100,
+    container geometry), which makes a full suspension solve 6-10x faster.
+    """
+    want_sl, want_dl = ("sl" in terms), ("dl" in terms)
+    sx, sy, sz = sig_vwx2xyz(sig_vwx[0], sig_vwx[1], sig_vwx[2], th, ph, sh)
+    g = jnp.stack([sx, sy, sz], axis=-1).reshape(-1, 3) * w[:, None]   # (Nsrc, 3) weighted
+    a2 = a * a
+    Nsrc = Y.shape[0]
+
+    # Source-only column blocks for the <coef> contraction (16 complex -> 32 real columns):
+    #   0:3 g_jk | 3 Y_j.g_j | 4:13 g_jm Y_jk | 13:16 (Y_j.g_j) Y_jk
+    b = jnp.sum(Y * g, axis=1)                                        # (Nsrc,)
+    Z = jnp.concatenate([g, b[:, None],
+                         (g[:, :, None] * Y[:, None, :]).reshape(Nsrc, 9),
+                         b[:, None] * Y], axis=1)                     # (Nsrc, 16)
+    Zr = jnp.concatenate([jnp.real(Z), jnp.imag(Z)], axis=1)          # (Nsrc, 32)
+    if want_sl:
+        Gr = jnp.concatenate([jnp.real(g), jnp.imag(g)], axis=1)      # (Nsrc, 6)
+
+    def body(tt):
+        X = tt - Xc                                                   # (nt, 3)
+        px = jnp.sum(X * X, axis=1)[:, None]                          # (nt, 1)
+        d2 = jnp.maximum(px + a2 - 2.0 * pair_dot(X, Y), 0.0)         # (nt, Nsrc)
+        invd = jax.lax.rsqrt(d2)
+        invd2 = invd * invd                                           # (= 1/d2, no divide)
+        invd3 = invd * invd2
+        coef = (sl_scal * STK_SL_FAR_PREFAC) * invd3 if want_sl else 0.0
+        if want_dl:
+            M = ((px - a2) * (invd3 * invd2) - invd3) / (2.0 * a)
+            coef = coef + (dl_scal * STK_DL_FAR_PREFAC) * M
+
+        R = coef @ Zr                                                 # (nt, 32)
+        Zo = R[:, :16] + 1j * R[:, 16:]                                # (nt, 16)
+        Cg = Zo[:, 0:3]                       # sum_j coef g_j
+        cb = Zo[:, 3]                         # sum_j coef (Y_j.g_j)
+        Tg = Zo[:, 4:13].reshape(-1, 3, 3)    # sum_j coef g_jm Y_jk
+        cbY = Zo[:, 13:16]                    # sum_j coef (Y_j.g_j) Y_jk
+        # sum_j coef (r.g_j) r  =  x_i (x_i.Cg - cb) - (x_i.Tg - cbY)
+        u = X * (jnp.sum(X * Cg, axis=1) - cb)[:, None] \
+            - (jnp.einsum("im,imk->ik", X, Tg) - cbY)
+        if want_sl:
+            Sg = invd @ Gr                                            # (nt, 6)
+            u = u + (sl_scal * STK_SL_FAR_PREFAC) * (Sg[:, :3] + 1j * Sg[:, 3:])
+        return u
+
+    return far_tile_map(body, (trg,), tile)
+
+def _stk_far(trg: jax.Array, sig_vwx: jax.Array, S: SphereDict, sh: shtns_jax.sht,
+             terms: tuple, sl_scal=0.0, dl_scal=0.0, tile: int = None) -> jax.Array:
+    """Eager wrapper of _stk_far_kernel: pulls the source-centred geometry out of <S> and
+    picks the target tile size, then calls the jitted kernel."""
+    Y, w, a, Xc = far_src_geom(S, sh)
+    return _stk_far_kernel(trg, sig_vwx, sl_scal, dl_scal, Y, w, a, Xc,
+                           S["Xsph"][:, :, 0], S["Xsph"][:, :, 1],
+                           sh=sh, tile=far_tile_size(Y.shape[0], tile), terms=terms)
+
+def Stk3d_sl_far(trg: jax.Array, sig_vwx: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
     Off-surface evaluation of the Stokes SL (Stokeslet) velocity with the vector
-    density S["Sigma"]
+    density coefficients <sig_vwx> (stacked VWX, shape (3, nlm))
         with <trg>: Ntrg x 3
         using the smooth surface quadrature (accurate only for targets well
-        away from the surface).
+        away from the surface). The direct quadrature needs the grid-space density, so
+        the VWX coefficients are first synthesized back to the Cartesian source grid
+        (inverse decomposition), then the direct matrix integral is applied.
     Returns the velocity at the targets: Ntrg x 3.
 
     Stokeslet kernel (matches compute_field): with r = trg - src, d = |r|,
         u_j(x) = (1/8pi) sum_src [ sigma_j / d + r_j (r.sigma) / d^3 ] * w.
+    Thin wrapper over the fused _stk_far kernel (see there for the quadrature).
     """
     assert trg.shape[1] == 3
+    return _stk_far(trg, sig_vwx, S, sh, ("sl",), sl_scal=1.0)
 
-    # Flatten the (nphi, ntheta, ...) grid arrays to per-source-point lists.
-    grid_shape = S["Xcart"].shape[:2]
-    ysrc = S["Xcart"].reshape(-1, 3)        # Nsrc x 3
-    fsrc = S["Sigma"].reshape(-1, 3)        # Nsrc x 3, vector density
-    # Gauss weights (1 x ntheta) broadcast over the (nphi, ntheta) grid, plus
-    # the r^2 surface Jacobian for a sphere of radius S["r"].
-    wts = jnp.broadcast_to(sh._grid_weights(), grid_shape).reshape(-1) * S["r"] ** 2
-
-    r = trg[:, None, :] - ysrc[None, :, :]  # Ntrg x Nsrc x 3, convention r = trg - src
-    d = jnp.linalg.norm(r, axis=2)          # Ntrg x Nsrc
-    rdotf = jnp.sum(r * fsrc[None, :, :], axis=2)  # Ntrg x Nsrc
-    term = fsrc[None, :, :] / d[..., None] + r * (rdotf / d ** 3)[..., None]
-    prefac = 1.0 / 8.0 / jnp.pi
-    SL_sigma = prefac * jnp.sum(term * wts[None, :, None], axis=1)  # Ntrg x 3
-    return SL_sigma
-
-def Stk3d_dl_far(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
+def Stk3d_dl_far(trg: jax.Array, sig_vwx: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
     Off-surface evaluation of the Stokes DL (stresslet) velocity with the vector
-    density S["Sigma"]
+    density coefficients <sig_vwx> (stacked VWX, shape (3, nlm))
         with <trg>: Ntrg x 3
         using the smooth surface quadrature (accurate only for targets well
-        away from the surface).
+        away from the surface). The VWX coefficients are synthesized to the Cartesian
+        source grid first, then the direct matrix integral is applied.
     Returns the velocity at the targets: Ntrg x 3.
 
     Stresslet kernel T_ijk = 6 r_i r_j r_k / d^5. With r = trg - src, d = |r|,
-    unit outward normal n = S["Xncart"] and density sigma = S["Sigma"],
+    unit outward normal n = S["Xncart"] and density sigma,
         u_j(x) = (6/8pi) sum_src [ (r.sigma)(r.n) / d^5 ] r_j * w.
-    The sign matches the spectral Stk3d_dl_r_1sph convention (verified in __main__).
+    Thin wrapper over the fused _stk_far kernel (see there for the quadrature).
     """
     assert trg.shape[1] == 3
+    return _stk_far(trg, sig_vwx, S, sh, ("dl",), dl_scal=1.0)
 
-    grid_shape = S["Xcart"].shape[:2]
-    ysrc = S["Xcart"].reshape(-1, 3)        # Nsrc x 3
-    fsrc = S["Sigma"].reshape(-1, 3)        # Nsrc x 3, vector density
-    nsrc = S["Xncart"].reshape(-1, 3)       # Nsrc x 3, unit outward normals
-    wts = jnp.broadcast_to(sh._grid_weights(), grid_shape).reshape(-1) * S["r"] ** 2
 
-    r = trg[:, None, :] - ysrc[None, :, :]  # Ntrg x Nsrc x 3, convention r = trg - src
-    d = jnp.linalg.norm(r, axis=2)          # Ntrg x Nsrc
-    rdotn = jnp.sum(r * nsrc[None, :, :], axis=2)   # Ntrg x Nsrc
-    rdots = jnp.sum(r * fsrc[None, :, :], axis=2)   # Ntrg x Nsrc
-    prefac = 6.0 / 8.0 / jnp.pi
-    DL_sigma = prefac * jnp.sum(r * (rdotn * rdots / d ** 5 * wts[None, :])[..., None], axis=1)
-    return DL_sigma
-
+# ============================
+# === Point and shoot ========
+# ============================
 
 def _ps_rotation(t_vec: jax.Array, lmax_src: int, lmax_trg: int) -> tuple:
     """Forward/inverse shtns rotations that bring the target-center direction onto
@@ -316,7 +395,6 @@ def _ps_scale_coeffs(sh: shtns_jax.sht, exterior: bool, which: str) -> tuple:
     coup = diag_W2V(sh, which) if exterior else diag_V2W(sh, which)
     return diag_V, diag_W, diag_X, coup
 
-
 def _ps_scale_vwx(vlm: jax.Array, wlm: jax.Array, xlm: jax.Array,
                   pw_V: jax.Array, pw_W: jax.Array, pw_X: jax.Array, exterior: bool,
                   which: str, coeffs: tuple) -> tuple:
@@ -406,8 +484,9 @@ def point_n_shoot_evaluator(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDic
                             near: bool = False):
     """
     Build a jitted point-and-shoot evaluator for a FIXED source/target geometry.
-    Returns a callable apply(sigma_cart, sl_scal, dl_scal) -> velocity (nphi_t, ntheta_t, 3)
-    for the combined Stokes layer potential K = sl_scal*SL + dl_scal*DL of source sphere
+    Returns a callable apply(sig_vwx, sl_scal, dl_scal) -> velocity VWX coefficients
+    (3, nlm_trg) on the target grid, for the combined Stokes layer potential
+    K = sl_scal*SL + dl_scal*DL of source sphere
     <S> at the surface grid of target sphere <Strg> (non-concentric). Implements the
     3-stage FFT-accelerated near-evaluation of Corona & Veerapaneni 2018 (JCP 362),
     Sec. 4.2 / Fig. 2:
@@ -493,10 +572,10 @@ def point_n_shoot_evaluator(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDic
                 [zzz, jnp.zeros((3, n - zzz.shape[1]), dtype=jnp.complex128)], axis=1)
         return zzz[:, :n]
 
-    def _core(sigma_cart: jax.Array, sl_scal, dl_scal) -> jax.Array:
-        # ---- source density -> Q/S/T coefficients (cplx layout) ----
-        sr, st_s, sp_s = cart2sph(sigma_cart[:, :, 0], sigma_cart[:, :, 1], sigma_cart[:, :, 2], th_s, ph_s)
-        qst_src = sh.analys_vec_cplx_jax(vec_stack(sr, st_s, sp_s))   # (3, nlm_src)
+    def _core(sig_vwx: jax.Array, sl_scal, dl_scal) -> jax.Array:
+        # ---- source density VWX coefficients -> Q/S/T coefficients (cplx layout) ----
+        qlm_s, slm_s, tlm_s = vwx2qst(sig_vwx[0], sig_vwx[1], sig_vwx[2], sh)
+        qst_src = vec_stack(qlm_s, slm_s, tlm_s)   # (3, nlm_src)
 
         # ---- STAGE 1: rotate the target center onto +z. #2: rotate all three scalar
         #      potentials in ONE vmapped FFI call over the stacked (3, nlm_src) array
@@ -521,39 +600,42 @@ def point_n_shoot_evaluator(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDic
         #      stacked (3, nlm_e) analysis output), band-limit to the target grid. ----
         qst_R = sh_eval.analys_vec_cplx_jax(vec_stack(vr_e, vt_e, vp_e))   # (3, nlm_e)
         qst_g = _pad3(jax.vmap(rot_inv.apply_cplx_jax)(qst_R), nlm_t)      # (3, nlm_t)
-        vr_g, vt_g, vp_g = vec_distr(shtrg.synth_vec_cplx_jax(qst_g))
-        ux, uy, uz = sph2cart(vr_g, vt_g, vp_g, th_t, ph_t)
-        return jnp.stack([ux, uy, uz], axis=2)
+        vlm_g, wlm_g, xlm_g = qst2vwx(qst_g[0], qst_g[1], qst_g[2], shtrg)
+        return jnp.stack([vlm_g, wlm_g, xlm_g], axis=0)   # (3, nlm_t) target-basis VWX coeffs
 
     return jax.jit(_core)
 
-def point_n_shoot(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: shtns_jax.sht,
+def point_n_shoot(Strg: SphereDict, shtrg: shtns_jax.sht, sig_vwx: jax.Array, S: SphereDict, sh: shtns_jax.sht,
                   sl_scal: float, dl_scal: float, near: bool = False) -> jax.Array:
     """
     Point-and-shoot (move-pole) evaluation of the combined Stokes layer potential
         K = sl_scal*SL + dl_scal*DL
-    of source sphere <S> (density S["Sigma"]) at the surface grid of target sphere <Strg>.
+    of source sphere <S> (density VWX coefficients <sig_vwx>, shape (3, nlm)) at the surface
+    grid of target sphere <Strg>.
     Thin wrapper over point_n_shoot_evaluator: fetches (or builds) the jitted evaluator for
-    this geometry from a module cache, then applies it to S["Sigma"]. Repeated calls with
+    this geometry from a module cache, then applies it to <sig_vwx>. Repeated calls with
     the same geometry (e.g. every GMRES iteration of the suspension matvec) reuse the same
     compiled kernel. See point_n_shoot_evaluator for the algorithm and clear_point_n_shoot_cache
-    to release cached kernels. Returns velocity at Strg's grid: (nphi_t, ntheta_t, 3) complex.
+    to release cached kernels. Returns the velocity VWX coefficients on Strg's grid:
+    (3, nlm_trg) complex.
     """
     key = _ps_geom_key(Strg, shtrg, S, sh)
     evaluator = _PS_EVALUATOR_CACHE.get(key)
     if evaluator is None:
         evaluator = point_n_shoot_evaluator(Strg, shtrg, S, sh, near=near)
         _PS_EVALUATOR_CACHE[key] = evaluator
-    return evaluator(S["Sigma"], sl_scal, dl_scal)
+    return evaluator(sig_vwx, sl_scal, dl_scal)
 
-def Stk3d_dl_point_and_shoot(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
+def Stk3d_dl_point_and_shoot(Strg: SphereDict, shtrg: shtns_jax.sht, sig_vwx: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """DL-only point-and-shoot (thin wrapper over point_n_shoot)."""
-    return point_n_shoot(Strg, shtrg, S, sh, 0.0, 1.0, near=False)
+    return point_n_shoot(Strg, shtrg, sig_vwx, S, sh, 0.0, 1.0, near=False)
 
 
 
 
-
+# ============================
+# === Eval ===================
+# ============================
 def _stk_trg_sph(trg: jax.Array, S: SphereDict) -> tuple([jax.Array, jax.Array, jax.Array]):
     """Spherical coordinates (dr, theta, phi) of targets <trg> relative to S["Xc"]."""
     trg_dx = trg[:,0] - S["Xc"][0]
@@ -564,136 +646,226 @@ def _stk_trg_sph(trg: jax.Array, S: SphereDict) -> tuple([jax.Array, jax.Array, 
     trg_theta = jnp.acos(trg_dz / trg_dr)
     return trg_dr, trg_theta, trg_phi
 
-def _stk_qst_to_points(qlm: jax.Array, slm: jax.Array, tlm: jax.Array, trg_theta: jax.Array, trg_phi: jax.Array, sh: shtns_jax.sht) -> jax.Array:
-    """Evaluate the complex Q/S/T vector expansion (per-target coefficients,
-    shape Ntrg x nlm_cplx) at the target points (trg_theta, trg_phi) and return
-    the Cartesian velocity Ntrg x 3.  Mirrors the per-target loop of Lap3d_dl: the
-    point synthesis uses the scalar shtns SHqst_to_point_cplx, only the C call is
-    looped (coefficients differ per target)."""
-    # Materialize every array to host once, up front. The per-target loop below calls into
-    # synchronous C (sh.SHqst_to_point_cplx), so nothing it touches may be a live JAX array:
-    # per-element host transfers inside the loop race the C call and can segfault.
-    qlm = np.asarray(qlm, dtype=np.complex128)
-    slm = np.asarray(slm, dtype=np.complex128)
-    tlm = np.asarray(tlm, dtype=np.complex128)
-    trg_theta = np.asarray(trg_theta, dtype=np.float64)
-    trg_phi = np.asarray(trg_phi, dtype=np.float64)
-    cost = np.cos(trg_theta)
-    def _helper(i):
-        vr, vt, vp = sh.SHqst_to_point_cplx(qlm[i], slm[i], tlm[i], float(cost[i]), float(trg_phi[i]))
-        vx, vy, vz = sph2cart(vr, vt, vp, trg_theta[i], trg_phi[i])
-        return vx, vy, vz
-    vals = [_helper(trg_i) for trg_i in range(qlm.shape[0])]
-    return jnp.array(vals, dtype=jnp.complex128)
+NEAR_TILE_BYTES = 24 << 20   # memory budget for ONE (tile, nlm_cplx) complex128 block
+_NEAR_PAD = 64               # chunk lengths are rounded up to this, to bucket compiled shapes
 
-def Stk3d_sl(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
+# Canonical sht per (lmax, zl), so that spheres sharing a resolution share ONE compiled kernel.
+_NEAR_SH_CANON: Dict[tuple, Any] = {}
+
+def _near_sh_canon(sh: shtns_jax.sht) -> shtns_jax.sht:
+    """The sht that _stk_near_kernel should be keyed on. That kernel is a static_argnames jit,
+    so it recompiles per sht OBJECT -- and quadr_suspension builds a separate sht per sphere,
+    so a suspension whose spheres share an lmax would compile it once per sphere (measured: 3.64 s
+    vs 0.65 s of first-call cost for a 5-sphere, 64-target evaluation). But the kernel reads
+    NOTHING from sh except lmax and zl -- directly, and through vwx2qst and the *_VWX_diag /
+    diag_W2V / diag_V2W symbol helpers -- and makes no FFI call, so (lmax, zl) fully determines
+    the compiled code and equivalent shts can share it. (_stk_far_kernel cannot do this: it calls
+    sh.synth_vec_cplx_jax, which is bound to its own sht.)"""
+    key = getattr(sh, "_stk_near_sh_key", None)
+    if key is None:
+        key = (int(sh.lmax), np.asarray(sh.zl, dtype=np.int64).tobytes())
+        sh._stk_near_sh_key = key
+    return _NEAR_SH_CANON.setdefault(key, sh)
+
+def _stk_near_tile(sh: shtns_jax.sht, tile: int = None) -> int:
+    """Targets per chunk of the near evaluation, always a multiple of _NEAR_PAD (so that the
+    padded target list splits into chunks of reusable shapes). The radially scaled coefficients
+    are (tile, nlm_cplx) complex and several are live at once -- 47 MB per array per 2800 targets
+    at lmax 32, 571 MB at lmax 64 -- so the chunk is set from a memory budget. (Unlike the far
+    kernel's tile, which is picked for gemm blocking on pair-shaped arrays; here the per-target
+    work is elementwise + a gather, so only memory matters.)"""
+    if tile is None:
+        tile = NEAR_TILE_BYTES // (16 * max(int(sh.nlm_cplx), 1))
+    return int(max(1, int(tile) // _NEAR_PAD)) * _NEAR_PAD
+
+def _stk_near_symbols(sh: shtns_jax.sht, sl_scal, dl_scal, a, exterior: bool) -> tuple:
+    """Radius-independent VWX diagonal + coupling symbols of the COMBINED operator
+    K = sl_scal*SL + dl_scal*DL, on the exterior or interior radial branch. The scaling is
+    linear in these symbols, so pre-combining them here lets the per-target radial scaling run
+    ONCE instead of once per operator; they are (nlm,), so this costs nothing per target.
+    <a> rides along in the SL weight (the SL block carries the source radius; DL is
+    scale-invariant). Returns (diag_V, diag_W, diag_X, coup).
+
+    Note the interior V->W coupling enters with OPPOSITE signs for the two operators
+    (rho^{l+1} - rho^{l-1} for SL, its negative for DL), so only <coup> takes the sign --
+    never the three diagonals."""
+    diag_V_sl, diag_W_sl, diag_X_sl = Stk3d_sl_VWX_diag(sh)
+    dVe, dWe, dXe, dVi, dWi, dXi = Stk3d_dl_VWX_diag(sh)
+    s = sl_scal * a
+    if exterior:
+        return (s * diag_V_sl + dl_scal * dVe,
+                s * diag_W_sl + dl_scal * dWe,
+                s * diag_X_sl + dl_scal * dXe,
+                s * diag_W2V(sh, "sl") + dl_scal * diag_W2V(sh, "dl"))
+    return (s * diag_V_sl + dl_scal * dVi,
+            s * diag_W_sl + dl_scal * dWi,
+            s * diag_X_sl + dl_scal * dXi,
+            s * diag_V2W(sh, "sl") - dl_scal * diag_V2W(sh, "dl"))
+
+@partial(jax.jit, static_argnames=["sh"])
+def _stk_near_kernel(trg_dr: jax.Array, sig_vwx: jax.Array, sl_scal, dl_scal, a,
+                     sh: shtns_jax.sht) -> tuple:
+    """
+    Per-target solid-harmonic scaling of the combined K = sl_scal*SL + dl_scal*DL applied to
+    the density VWX coefficients <sig_vwx> ((3, nlm)), for targets at source-centred radii
+    <trg_dr> (Ntrg,). Returns the per-target Q/S/T coefficients (each Ntrg x nlm_cplx) ready
+    for point synthesis. The near counterpart of _stk_far_kernel; two structural savings over
+    the previous per-operator Stk3d_sl / Stk3d_dl:
+
+    - ONE scaling pass instead of two. _stk_near_symbols pre-combines the SL and DL symbols
+      per radial branch (the scaling is linear in them), so the ~14 (Ntrg, nlm) temporaries
+      per operator collapse to one fused chain.
+    - O(lmax) transcendental powers per target instead of O(nlm). The solid-harmonic radial
+      power depends only on the DEGREE l, so the leading power is evaluated over degrees
+      0..lmax and gathered onto the mode axis (a mode of degree l gets the same float exponent
+      either way), and the other two follow by multiplies: rho^{-l} = rho^{-l-2} rho^2 etc.
+      Two power arrays in total, where the old pair of kernels evaluated 16 (Ntrg, nlm) ones.
+
+    Both radial branches are still evaluated and selected with one jnp.where on trg_dr > a,
+    exactly as before, so a target list may straddle the source radius.
+
+    Accuracy vs the old pair of kernels: <= 1.5e-15 on every geometry tested except a
+    deep-interior one (source radius 3, rho down to 0.03), where it is 3e-14. That outlier is
+    the <a> fold, not the fused symbols or the derived powers: rescaling the same geometry to
+    a = 1, which makes the fold exact, drops it to 9.8e-16 (the derived powers alone contribute
+    ~5e-16). It is a rounding-order change on an interior expansion spanning ~25 decades, i.e.
+    an intrinsically ill-conditioned synthesis -- on that case old and new sit equidistant
+    (6.02e-13) from the smooth-quadrature reference, so the difference is far below the method's
+    own error there, and at higher lmax the new result is marginally closer.
+    """
+    vlm, wlm, xlm = sig_vwx[0], sig_vwx[1], sig_vwx[2]
+    rho = (trg_dr / a)[:, None]                                  # (Ntrg, 1)
+    zl = jnp.asarray(sh.zl, dtype=jnp.int32)                     # degree of each cplx mode
+    deg = jnp.arange(int(sh.lmax) + 1, dtype=jnp.float64)        # 0 .. lmax
+
+    pV_ext = (rho ** (-deg - 2.0))[:, zl]                        # rho^{-l-2}
+    pW_ext = pV_ext * rho * rho                                  # rho^{-l}
+    pX_ext = pV_ext * rho                                        # rho^{-l-1}
+    pV_int = (rho ** (deg + 1.0))[:, zl]                         # rho^{l+1}
+    pW_int = pV_int / (rho * rho)                                # rho^{l-1}
+    pX_int = pV_int / rho                                        # rho^{l}
+
+    dV_e, dW_e, dX_e, coup_e = _stk_near_symbols(sh, sl_scal, dl_scal, a, True)
+    dV_i, dW_i, dX_i, coup_i = _stk_near_symbols(sh, sl_scal, dl_scal, a, False)
+    v_ext = pV_ext * dV_e * vlm + (pV_ext - pW_ext) * coup_e * wlm     # W -> V coupling
+    w_ext = pW_ext * dW_e * wlm
+    x_ext = pX_ext * dX_e * xlm
+    v_int = pV_int * dV_i * vlm
+    w_int = pW_int * dW_i * wlm + (pV_int - pW_int) * coup_i * vlm     # V -> W coupling
+    x_int = pX_int * dX_i * xlm
+
+    is_ext = (trg_dr > a)[:, None]
+    return vwx2qst(jnp.where(is_ext, v_ext, v_int),
+                   jnp.where(is_ext, w_ext, w_int),
+                   jnp.where(is_ext, x_ext, x_int), sh)
+
+def _stk_near(trg: jax.Array, sig_vwx: jax.Array, S: SphereDict, sh: shtns_jax.sht,
+              sl_scal=0.0, dl_scal=0.0, tile: int = None) -> jax.Array:
+    """
+    Fused spectral ("near") evaluation of K = sl_scal*SL + dl_scal*DL at arbitrary targets
+    <trg> (Ntrg x 3) from source <S> with density VWX coefficients <sig_vwx> ((3, nlm)).
+    Returns the Cartesian velocity: Ntrg x 3. Accurate for targets close to the surface,
+    where the smooth quadrature (_stk_far) is not; eager wrapper of _stk_near_kernel.
+
+    The point synthesis itself is the irreducibly eager part: sh.SHqst_to_point_cplx is a
+    synchronous C evaluator and every target carries its OWN scaled coefficients, so it is
+    called once per target. Everything around that call is hoisted out of the loop -- the
+    scaling into the jitted kernel, the spherical->Cartesian rotation into a single vectorized
+    sph2cart. That matters more than it looks: previously sph2cart (a jnp function) was called
+    INSIDE the loop and the result assembled with jnp.array(list_of_tuples), so ~92% of the
+    loop's wall time was per-target JAX dispatch and only ~1.5% was the C synthesis.
+
+    Targets are processed in chunks (see _stk_near_tile) to bound the (Ntrg, nlm) coefficient
+    blocks. The target list is first padded up to a multiple of _NEAR_PAD, so that EVERY
+    shape downstream -- the geometry, the jitted kernel, the closing sph2cart -- is reused
+    across nearby target counts. That matters because those surrounding ops run eagerly, and
+    eager JAX compiles each primitive per shape: with an unbucketed count, a caller whose
+    target count varies (bio_offsurf_apply(far=None), whose near subset follows the geometry)
+    pays a few hundred ms of warm-up on every call. Cost of the padding: at most _NEAR_PAD-1
+    wasted rows of scaling (the C synthesis is never run on them).
+
+    Measured 13-24x faster than the previous per-operator Stk3d_sl + Stk3d_dl pair (lmax 16-36,
+    5 geometries), and 4.6-8.0x on the off-surface field evaluation of the container-obstacle
+    benchmark.
+
+    NOTE for later -- there is another ~5x sitting inside SHqst_to_point_cplx that this does not
+    take. Per call (shtns_jax.py:169) it re-derives sin(th)dS/dth, sin(th)dT/dth, i m S and i m T
+    from sh._dtheta_cplx_op()'s cached gather indices, then makes 5 scalar SH_to_point_cplx C
+    calls. Those derivations are fixed-index gathers and constant multiplies, linear along nlm
+    and independent of the target, so they could be vectorized into _stk_near_kernel over the
+    whole (Ntrg, nlm) block, leaving only the raw C calls in the loop: measured 5.5x (lmax 32) to
+    7.3x (lmax 16) on that stage alone. Doing so means duplicating the four vt/vp assembly lines
+    here, so it is better done behind a public batched entry point in shtns_jax (see the module
+    TODO) than by reaching into the underscore helper from this file.
+    """
+    assert trg.shape[1] == 3
+    if S["lmax"] != sh.lmax:
+        print("S lmax does not match sht's lmax, reform sht.")
+        sh = shtns_jax.sht(S["lmax"], S["lmax"])
+
+    Nt = trg.shape[0]
+    if Nt == 0:
+        return jnp.zeros((0, 3), dtype=jnp.complex128)
+    a = jnp.asarray(S["r"], dtype=jnp.float64)
+    tile = _stk_near_tile(sh, tile)          # a multiple of _NEAR_PAD
+
+    n_tot = -(-Nt // _NEAR_PAD) * _NEAR_PAD  # bucketed length; every chunk below is a
+    if n_tot > Nt:                           # multiple of _NEAR_PAD, so shapes are reused
+        trg = jnp.concatenate([trg, jnp.broadcast_to(trg[-1], (n_tot - Nt, 3))])
+    trg_dr, trg_theta, trg_phi = _stk_trg_sph(trg, S)
+
+    # Host-side geometry for the C loop. As before, everything the loop touches is
+    # materialized up front: per-element transfers inside the loop race the synchronous C
+    # call and can segfault.
+    cost_h = np.cos(np.asarray(trg_theta, dtype=np.float64))
+    phi_h = np.asarray(trg_phi, dtype=np.float64)
+    vr = np.zeros(n_tot, dtype=np.complex128)
+    vt = np.zeros(n_tot, dtype=np.complex128)
+    vp = np.zeros(n_tot, dtype=np.complex128)
+
+    sh_k = _near_sh_canon(sh)      # jit key only; the C synthesis below uses the caller's sh
+    for start in range(0, n_tot, tile):
+        stop = min(start + tile, n_tot)
+        qlm, slm, tlm = _stk_near_kernel(trg_dr[start:stop], sig_vwx,
+                                         sl_scal, dl_scal, a, sh=sh_k)
+        qn = np.asarray(qlm, dtype=np.complex128)
+        sn = np.asarray(slm, dtype=np.complex128)
+        tn = np.asarray(tlm, dtype=np.complex128)
+        for i in range(min(stop, Nt) - start):        # skip the padding rows
+            j = start + i
+            vr[j], vt[j], vp[j] = sh.SHqst_to_point_cplx(
+                qn[i], sn[i], tn[i], float(cost_h[j]), float(phi_h[j]))
+
+    vx, vy, vz = sph2cart(jnp.asarray(vr), jnp.asarray(vt), jnp.asarray(vp),
+                          trg_theta, trg_phi)
+    return jnp.stack([vx, vy, vz], axis=1)[:Nt]
+
+def Stk3d_sl(trg: jax.Array, sig_vwx: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
     Off-surface evaluation of the Stokes SL velocity at arbitrary points <trg>: Ntrg x 3
-        From source <S> with density <S["Sigma"]>, source uses SHT object <sh>.
-    Spectral solid-harmonic scaling identical to Stk3d_sl_r_1sph, but per-target
+        From source <S> with density VWX coefficients <sig_vwx> ((3, nlm)), source uses <sh>.
+    Spectral solid-harmonic scaling, but per-target
     radius and point synthesis.  Returns Ntrg x 3.
+    Thin wrapper over the fused _stk_near kernel (see there for the scaling).
     """
     assert trg.shape[1] == 3
-    if S["lmax"] != sh.lmax:
-        print("S lmax does not match sht's lmax, reform sht.")
-        sh = shtns_jax.sht(S["lmax"], S["lmax"])
+    return _stk_near(trg, sig_vwx, S, sh, sl_scal=1.0, dl_scal=0.0)
 
-    vlm_sigma, wlm_sigma, xlm_sigma = sig_xyz2vwx(
-        S["Sigma"][:,:,0], S["Sigma"][:,:,1], S["Sigma"][:,:,2],
-        S["Xsph"][:,:,0], S["Xsph"][:,:,1], sh)
-
-    trg_dr, trg_theta, trg_phi = _stk_trg_sph(trg, S)
-    trg_dr = trg_dr[:,None]   # Ntrg x 1, broadcasts against (nlm,)
-    a = S['r']
-    rho = trg_dr / a          # solid harmonics evaluated as if src sphere were unit
-    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
-    diag_V, diag_W, diag_X = Stk3d_sl_VWX_diag(sh)
-    rpowers_V_ext = rho ** (-l_vals-2.0)
-    rpowers_V_int = rho ** (l_vals+1.0)
-    vlm_SL_sigma_ext = rpowers_V_ext * diag_V * vlm_sigma
-    vlm_SL_sigma_int = rpowers_V_int * diag_V * vlm_sigma
-
-    rpowers_W_ext = rho ** (-l_vals)
-    rpowers_W_int = rho ** (l_vals - 1.0)
-    wlm_SL_sigma_ext = rpowers_W_ext * diag_W * wlm_sigma
-    wlm_SL_sigma_int = rpowers_W_int * diag_W * wlm_sigma
-
-    rpowers_X_ext = rho ** (-l_vals - 1.0)
-    rpowers_X_int = rho ** (l_vals)
-    xlm_SL_sigma_ext = rpowers_X_ext * diag_X * xlm_sigma
-    xlm_SL_sigma_int = rpowers_X_int * diag_X * xlm_sigma
-
-    diag_V2W_int = diag_V2W(sh, "sl")
-    diag_W2V_ext = diag_W2V(sh, "sl")
-    rpowers_V2W_int = rho ** (l_vals+1.0) - rho ** (l_vals - 1.0) # Note: TYPO IN PAPER
-    rpowers_W2V_ext = rho ** (-l_vals - 2.0) - rho ** (-l_vals)
-    V2Wlm_SL_sigma_int = rpowers_V2W_int * diag_V2W_int * vlm_sigma
-    W2Vlm_SL_sigma_ext = rpowers_W2V_ext * diag_W2V_ext * wlm_sigma
-
-    is_ext = trg_dr > a
-    vlm_SL_sigma = jnp.where(is_ext, vlm_SL_sigma_ext + W2Vlm_SL_sigma_ext, vlm_SL_sigma_int)
-    wlm_SL_sigma = jnp.where(is_ext, wlm_SL_sigma_ext, wlm_SL_sigma_int + V2Wlm_SL_sigma_int)
-    xlm_SL_sigma = jnp.where(is_ext, xlm_SL_sigma_ext, xlm_SL_sigma_int)
-
-    qlm, slm, tlm = vwx2qst(vlm_SL_sigma, wlm_SL_sigma, xlm_SL_sigma, sh)
-    return a * _stk_qst_to_points(qlm, slm, tlm, trg_theta, trg_phi, sh)   # SL scales by a
-
-def Stk3d_dl(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
+def Stk3d_dl(trg: jax.Array, sig_vwx: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
     Off-surface evaluation of the Stokes DL velocity at arbitrary points <trg>: Ntrg x 3
-        From source <S> with density <S["Sigma"]>, source uses SHT object <sh>.
-    Spectral solid-harmonic scaling identical to Stk3d_dl_r_1sph, but per-target
+        From source <S> with density VWX coefficients <sig_vwx> ((3, nlm)), source uses <sh>.
+    Spectral solid-harmonic scaling, but per-target
     radius and point synthesis.  Returns Ntrg x 3.
+    Thin wrapper over the fused _stk_near kernel (see there for the scaling).
     """
     assert trg.shape[1] == 3
-    if S["lmax"] != sh.lmax:
-        print("S lmax does not match sht's lmax, reform sht.")
-        sh = shtns_jax.sht(S["lmax"], S["lmax"])
+    return _stk_near(trg, sig_vwx, S, sh, sl_scal=0.0, dl_scal=1.0)
 
-    vlm_sigma, wlm_sigma, xlm_sigma = sig_xyz2vwx(
-        S["Sigma"][:,:,0], S["Sigma"][:,:,1], S["Sigma"][:,:,2],
-        S["Xsph"][:,:,0], S["Xsph"][:,:,1], sh)
-
-    trg_dr, trg_theta, trg_phi = _stk_trg_sph(trg, S)
-    trg_dr = trg_dr[:,None]
-    a = S['r']
-    rho = trg_dr / a          # solid harmonics evaluated as if src sphere were unit
-    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
-    diag_V_ext, diag_W_ext, diag_X_ext, diag_V_int, diag_W_int, diag_X_int = Stk3d_dl_VWX_diag(sh)
-
-    rpowers_V_ext = rho ** (- l_vals - 2.0)
-    rpowers_V_int = rho ** (l_vals + 1.0)
-    vlm_DL_sigma_ext = rpowers_V_ext * diag_V_ext * vlm_sigma
-    vlm_DL_sigma_int = rpowers_V_int * diag_V_int * vlm_sigma
-
-    rpowers_W_ext = rho ** (-l_vals)
-    rpowers_W_int = rho ** (l_vals - 1.0)
-    wlm_DL_sigma_ext = rpowers_W_ext * diag_W_ext * wlm_sigma
-    wlm_DL_sigma_int = rpowers_W_int * diag_W_int * wlm_sigma
-
-    rpowers_X_ext = rho ** (-l_vals - 1.0)
-    rpowers_X_int = rho ** (l_vals)
-    xlm_DL_sigma_ext = rpowers_X_ext * diag_X_ext * xlm_sigma
-    xlm_DL_sigma_int = rpowers_X_int * diag_X_int * xlm_sigma
-
-    diag_V2W_int = diag_V2W(sh, "dl")
-    diag_W2V_ext = diag_W2V(sh, "dl")
-    rpowers_V2W_int = - rho ** (l_vals + 1.0) + rho ** (l_vals - 1.0)
-    rpowers_W2V_ext = rho ** (-l_vals - 2.0) - rho ** (-l_vals)
-    V2Wlm_DL_sigma_int = rpowers_V2W_int * diag_V2W_int * vlm_sigma
-    W2Vlm_DL_sigma_ext = rpowers_W2V_ext * diag_W2V_ext * wlm_sigma
-
-    is_ext = trg_dr > a
-    vlm_DL_sigma = jnp.where(is_ext, vlm_DL_sigma_ext + W2Vlm_DL_sigma_ext, vlm_DL_sigma_int)
-    wlm_DL_sigma = jnp.where(is_ext, wlm_DL_sigma_ext, wlm_DL_sigma_int + V2Wlm_DL_sigma_int)
-    xlm_DL_sigma = jnp.where(is_ext, xlm_DL_sigma_ext, xlm_DL_sigma_int)
-
-    qlm, slm, tlm = vwx2qst(vlm_DL_sigma, wlm_DL_sigma, xlm_DL_sigma, sh)
-    return _stk_qst_to_points(qlm, slm, tlm, trg_theta, trg_phi, sh)
-
-def bio_offsurf_apply(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, far: bool = None, sep_eta: float = 1e-1) -> jax.Array:
+def bio_offsurf_apply(trg: jax.Array, sig_vwx: jax.Array, S: SphereDict, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, far: bool = None, sep_eta: float = 1e-1) -> jax.Array:
     """
-    Evaluate the KL formulation of <S> with density <S["Sigma"]> at arbitrary target <trg>: Ntrg x 3.
+    Evaluate the KL formulation of <S> with density VWX coefficients <sig_vwx> ((3, nlm))
+    at arbitrary target <trg>: Ntrg x 3. Returns point values (Ntrg x 3).
 
     The two SL/DL kernels have complementary accuracy: the spectral solid-harmonic
     synthesis (Stk3d_sl/Stk3d_dl) is accurate for targets close to the surface, while
@@ -702,47 +874,51 @@ def bio_offsurf_apply(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht, sl_scal:
     one kernel for the whole target list, this function separates targets per-target and
     routes each to the appropriate kernel:
         far == None (default): split trg into far/near via separate_target (surface gap
-                               > sep_eta * r) and combine with jnp.where -- far targets
-                               use the smooth quadrature, near targets the spectral eval.
+                               > sep_eta * r) and evaluate each kernel on ITS OWN targets
+                               only -- far targets use the smooth quadrature, near targets
+                               the spectral eval.
         far == True          : force the smooth quadrature for every target.
         far == False         : force the spectral synthesis for every target.
-    (jnp.where keeps shapes static so the routed default stays jit-traceable; both kernels
-    are evaluated for all targets and selected pointwise.)
     """
     if far is True:
-        SLsigma = Stk3d_sl_far(trg, S, sh)
-        DLsigma = Stk3d_dl_far(trg, S, sh)
-    elif far is False:
-        SLsigma = Stk3d_sl(trg, S, sh)
-        DLsigma = Stk3d_dl(trg, S, sh)
-    else:
-        # far is None: separate targets into far/near per-target using sep_eta.
-        sep_far = separate_target(trg, S, sep_eta)[:, None]   # (Ntrg, 1) bool, True == far
-        SLsigma = jnp.where(sep_far, Stk3d_sl_far(trg, S, sh), Stk3d_sl(trg, S, sh))
-        DLsigma = jnp.where(sep_far, Stk3d_dl_far(trg, S, sh), Stk3d_dl(trg, S, sh))
-    Ksigma = sl_scal * SLsigma + dl_scal * DLsigma
+        return _stk_far(trg, sig_vwx, S, sh, ("sl", "dl"), sl_scal=sl_scal, dl_scal=dl_scal)
+    if far is False:
+        return _stk_near(trg, sig_vwx, S, sh, sl_scal=sl_scal, dl_scal=dl_scal)
+
+    # far is None: separate targets into far/near using sep_eta and route by INDEX. The
+    # near half (_stk_near) ends in an eager per-point C synthesis, so this branch can
+    # never run under jit anyway -- which lets the split be a concrete gather/scatter
+    # instead of evaluating both kernels everywhere and selecting with jnp.where.
+    sep_far = np.asarray(separate_target(trg, S, sep_eta))
+    idx_far = np.flatnonzero(sep_far)
+    idx_near = np.flatnonzero(~sep_far)
+    Ksigma = jnp.zeros((trg.shape[0], 3), dtype=jnp.complex128)
+    if idx_far.size:
+        Ksigma = Ksigma.at[idx_far].set(
+            _stk_far(trg[idx_far], sig_vwx, S, sh, ("sl", "dl"), sl_scal=sl_scal, dl_scal=dl_scal))
+    if idx_near.size:
+        Ksigma = Ksigma.at[idx_near].set(
+            _stk_near(trg[idx_near], sig_vwx, S, sh, sl_scal=sl_scal, dl_scal=dl_scal))
     return Ksigma
 
 @partial(jax.jit, static_argnames=["sh"])
-def bio_onsurf_apply(sigma_tens: jax.Array, theta: jax.Array, phi: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0., radius: float = 1.0) -> jax.Array:
+def bio_onsurf_apply(sig_vwx: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0., radius: float = 1.0) -> jax.Array:
     """
     Apply the combined DL potential operator K = sl_scal * SL + dl_scal * DL
-        to the density <sigma_tens> defined on the <sh> grid
+        to the density with VWX (diagonalizing-basis) coefficients <sig_vwx> ((3, nlm))
         taking into account the DL jump condition with sign <sgn>.
-    Returns the resulting function, also defined on the <sh> grid.
+    Returns the resulting function's VWX coefficients ((3, nlm)), so the on-surface
+    self-apply is a pure per-component diagonal multiply (COB is the caller's responsibility).
     The SL block scales by the source-sphere <radius> (DL/dSL/jump are scale-invariant).
     """
 
-    sigma_x = sigma_tens[:,:,0]
-    sigma_y = sigma_tens[:,:,1]
-    sigma_z = sigma_tens[:,:,2]
-    vlm, wlm, xlm = sig_xyz2vwx(sigma_x, sigma_y, sigma_z, theta, phi, sh)
+    vlm, wlm, xlm = sig_vwx[0], sig_vwx[1], sig_vwx[2]
 
     diag_V, diag_W, diag_X = Stk3d_sl_VWX_diag(sh)
     vlm_SL_sigma = radius * diag_V * vlm
     wlm_SL_sigma = radius * diag_W * wlm
     xlm_SL_sigma = radius * diag_X * xlm
-    
+
     diag_V_ext, diag_W_ext, diag_X_ext, diag_V_int, diag_W_int, diag_X_int = Stk3d_dl_VWX_diag(sh)
     vlm_DL_sigma = 0.5*(diag_V_int + diag_V_ext) * vlm
     wlm_DL_sigma = 0.5*(diag_W_int + diag_W_ext) * wlm
@@ -753,26 +929,24 @@ def bio_onsurf_apply(sigma_tens: jax.Array, theta: jax.Array, phi: jax.Array, sh
     wlm_dSL_sigma = 0.5*(diag_W_int + diag_W_ext) * wlm
     xlm_dSL_sigma = 0.5*(diag_X_int + diag_X_ext) * xlm
 
-    vlm_op = sl_scal * vlm_SL_sigma + dl_scal * vlm_DL_sigma + dsl_scal * vlm_dSL_sigma
-    wlm_op = sl_scal * wlm_SL_sigma + dl_scal * wlm_DL_sigma + dsl_scal * wlm_dSL_sigma
-    xlm_op = sl_scal * xlm_SL_sigma + dl_scal * xlm_DL_sigma + dsl_scal * xlm_dSL_sigma
+    # The jump condition is a multiple of the identity, hence diagonal in the VWX basis too.
+    jump = 0.5 * sgn * dl_scal + 0.5 * (-1*sgn) * dsl_scal
+    vlm_op = sl_scal * vlm_SL_sigma + dl_scal * vlm_DL_sigma + dsl_scal * vlm_dSL_sigma + jump * vlm
+    wlm_op = sl_scal * wlm_SL_sigma + dl_scal * wlm_DL_sigma + dsl_scal * wlm_dSL_sigma + jump * wlm
+    xlm_op = sl_scal * xlm_SL_sigma + dl_scal * xlm_DL_sigma + dsl_scal * xlm_dSL_sigma + jump * xlm
 
-    vx,vy,vz = sig_vwx2xyz(vlm_op,wlm_op,xlm_op,theta,phi,sh)
-    vx = vx + 0.5 * sgn * dl_scal * sigma_x + 0.5 * (-1*sgn) * dsl_scal * sigma_x
-    vy = vy + 0.5 * sgn * dl_scal * sigma_y + 0.5 * (-1*sgn) * dsl_scal * sigma_y
-    vz = vz + 0.5 * sgn * dl_scal * sigma_z + 0.5 * (-1*sgn) * dsl_scal * sigma_z
-    V = jnp.stack([vx, vy, vz], axis=2)
-
-    return V
+    return jnp.stack([vlm_op, wlm_op, xlm_op], axis=0)
 
 @partial(jax.jit, static_argnames=["sh"])
-def stokes_onsurf_direct_solve(bc_vec: jax.Array, theta: jax.Array, phi: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0., radius: float = 1.0) -> jax.Array:
+def stokes_onsurf_direct_solve(sig_vwx_bc: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0., radius: float = 1.0) -> jax.Array:
     """
-    Directly solves the Stokes BIO equation using the VWX diagonal property.
+    Directly solves the Stokes BIO equation using the VWX diagonal property. The right-hand
+    side and returned density are both given by their VWX (diagonalizing-basis) coefficients
+    (<sig_vwx_bc> in, sig_vwx out, each (3, nlm)); the solve is a per-component diagonal division.
     The SL block scales by the source-sphere <radius> (DL/dSL/jump are scale-invariant).
     """
 
-    vlm_bc, wlm_bc, xlm_bc = sig_xyz2vwx(bc_vec[:,:,0], bc_vec[:,:,1], bc_vec[:,:,2], theta, phi, sh)
+    vlm_bc, wlm_bc, xlm_bc = sig_vwx_bc[0], sig_vwx_bc[1], sig_vwx_bc[2]
     diag_V_sl, diag_W_sl, diag_X_sl = Stk3d_sl_VWX_diag(sh)
     diag_V_ext, diag_W_ext, diag_X_ext, diag_V_int, diag_W_int, diag_X_int = Stk3d_dl_VWX_diag(sh)
     diag_V_dl = 0.5 * (diag_V_int + diag_V_ext)
@@ -798,9 +972,7 @@ def stokes_onsurf_direct_solve(bc_vec: jax.Array, theta: jax.Array, phi: jax.Arr
     wlm_sigma = safe_div(wlm_bc, op_diag_W)
     xlm_sigma = safe_div(xlm_bc, op_diag_X)
 
-    sig_x, sig_y, sig_z = sig_vwx2xyz(vlm_sigma, wlm_sigma, xlm_sigma, theta, phi, sh)
-    
-    return jnp.stack([sig_x, sig_y, sig_z], axis=-1)
+    return jnp.stack([vlm_sigma, wlm_sigma, xlm_sigma], axis=0)
 
 def compute_field(trg: jax.Array, src: jax.Array, force: jax.Array) -> jax.Array:
     """
@@ -864,6 +1036,8 @@ def compute_traction(trg: jax.Array, trgN: jax.Array, src: jax.Array, force: jax
     
     return u.astype(jnp.complex128)
     
+
+
 if __name__ == "__main__":
     """
     Test Stokes operators on spheres using manufactured solutions.
@@ -902,24 +1076,28 @@ if __name__ == "__main__":
     BC_pot = compute_field(trg_sphere, ptsrc, force)
     BC_pot = jnp.reshape(BC_pot, S["Xcart"].shape)
 
-    # DIRECT solve
-    sig_direct = stokes_onsurf_direct_solve(BC_pot, theta, phi, sh, sl_scal, dl_scal, sgn)
-    bc_check_direct = bio_onsurf_apply(sig_direct, theta, phi, sh, sl_scal, dl_scal, sgn)
-    resid_direct = jnp.linalg.norm(bc_check_direct - BC_pot)
+    # DIRECT solve -- densities are handled in the VWX (diagonalizing) basis: COB the
+    # boundary data with sig_xyz2vwx before the solve, invert with sig_vwx2xyz before the error.
+    vwx_bc = jnp.stack(sig_xyz2vwx(BC_pot[:,:,0], BC_pot[:,:,1], BC_pot[:,:,2], theta, phi, sh), axis=0)
+    vwx_sig = stokes_onsurf_direct_solve(vwx_bc, sh, sl_scal, dl_scal, sgn)
+    vwx_bc_check = bio_onsurf_apply(vwx_sig, sh, sl_scal, dl_scal, sgn)
+    resid_direct = jnp.linalg.norm(vwx_bc_check - vwx_bc)
     print("Residual of DIRECT solve = {a}".format(a=resid_direct))
 
     # Accuracy
-    xtrg = Strg["Xcart"][:,:,0] 
+    xtrg = Strg["Xcart"][:,:,0]
     ytrg = Strg["Xcart"][:,:,1]
     ztrg = Strg["Xcart"][:,:,2]
+    theta_trg = Strg["Xsph"][:,:,0]
+    phi_trg = Strg["Xsph"][:,:,1]
     trg_sphere2 = jnp.column_stack([jnp.reshape(xtrg,-1), jnp.reshape(ytrg,-1), jnp.reshape(ztrg,-1)])
-    true_field = compute_field(trg_sphere2, ptsrc, force) 
+    true_field = compute_field(trg_sphere2, ptsrc, force)
     true_field = jnp.reshape(true_field, Strg["Xcart"].shape)
     true_field = jnp.real(true_field)
 
-    S = set_density(S, sig_direct[:,:,0], sig_direct[:,:,1], sig_direct[:,:,2])
-    Ksig_direct = point_n_shoot(Strg, shtrg, S, sh, sl_scal, dl_scal)
-    Ksig_direct = jnp.real(Ksig_direct)
+    vwx_out = point_n_shoot(Strg, shtrg, vwx_sig, S, sh, sl_scal, dl_scal)
+    vx, vy, vz = sig_vwx2xyz(vwx_out[0], vwx_out[1], vwx_out[2], theta_trg, phi_trg, shtrg)
+    Ksig_direct = jnp.real(jnp.stack([vx, vy, vz], axis=2))
 
     diff_direct = jnp.max(true_field - Ksig_direct) / jnp.max(true_field)
     print("Max relative error of order {lmax} solver at target radius {Rtrg} for direct solver is {d}".format(lmax=lmax, Rtrg=Rtrg, d=diff_direct))
@@ -931,32 +1109,35 @@ if __name__ == "__main__":
     yn = S["Xncart"][:,:,1]
     zn = S["Xncart"][:,:,2]
     trgN_sphere = jnp.column_stack([jnp.reshape(xn,-1), jnp.reshape(yn,-1), jnp.reshape(zn,-1)])
-    BC_flux = compute_traction(trg_sphere, trgN_sphere, ptsrc, force) 
+    BC_flux = compute_traction(trg_sphere, trgN_sphere, ptsrc, force)
     BC_flux = jnp.reshape(BC_flux, S["Xcart"].shape)
     # DIRECT solve
-    sig_direct = stokes_onsurf_direct_solve(
-        BC_flux, theta, phi,
+    vwx_bc = jnp.stack(sig_xyz2vwx(BC_flux[:,:,0], BC_flux[:,:,1], BC_flux[:,:,2], theta, phi, sh), axis=0)
+    vwx_sig = stokes_onsurf_direct_solve(
+        vwx_bc,
         sh=sh,
         sl_scal=0.,
         dl_scal=0.,
         sgn=sgn,
         dsl_scal=1.0
     )
-    bc_check_direct = bio_onsurf_apply(sig_direct, theta, phi, sh, 0., 0., sgn, 1.0)
-    resid_direct = jnp.linalg.norm(bc_check_direct - BC_flux)
+    vwx_bc_check = bio_onsurf_apply(vwx_sig, sh, 0., 0., sgn, 1.0)
+    resid_direct = jnp.linalg.norm(vwx_bc_check - vwx_bc)
     jax.debug.print("Residual of DIRECT solve: {a}", a=resid_direct)
     # Accuracy
-    xtrg = Strg["Xcart"][:,:,0] 
+    xtrg = Strg["Xcart"][:,:,0]
     ytrg = Strg["Xcart"][:,:,1]
     ztrg = Strg["Xcart"][:,:,2]
+    theta_trg = Strg["Xsph"][:,:,0]
+    phi_trg = Strg["Xsph"][:,:,1]
     trg_sphere2 = jnp.column_stack([jnp.reshape(xtrg,-1), jnp.reshape(ytrg,-1), jnp.reshape(ztrg,-1)])
     true_field = compute_field(trg_sphere2, ptsrc, force)
     true_field = jnp.reshape(true_field, Strg["Xcart"].shape)
     true_field = jnp.real(true_field)
 
-    S = set_density(S, sig_direct[:,:,0], sig_direct[:,:,1], sig_direct[:,:,2])
-    Ksig_direct = point_n_shoot(Strg, shtrg, S, sh, 1.0, 0.)
-    Ksig_direct = jnp.real(Ksig_direct)
+    vwx_out = point_n_shoot(Strg, shtrg, vwx_sig, S, sh, 1.0, 0.)
+    vx, vy, vz = sig_vwx2xyz(vwx_out[0], vwx_out[1], vwx_out[2], theta_trg, phi_trg, shtrg)
+    Ksig_direct = jnp.real(jnp.stack([vx, vy, vz], axis=2))
 
     diff_direct = jnp.max(true_field - Ksig_direct) / jnp.max(true_field)
     jax.debug.print("Max relative error of order {lmax} solver at target radius {Rtrg} for direct solver is {d}", lmax=lmax, Rtrg=Rtrg, d=diff_direct)
@@ -986,35 +1167,40 @@ if __name__ == "__main__":
     BC_pot = jnp.reshape(BC_pot, S["Xcart"].shape)
 
     # DIRECT solve
-    sig_direct = stokes_onsurf_direct_solve(BC_pot, theta, phi, sh, sl_scal, dl_scal, sgn)
-    bc_check_direct = bio_onsurf_apply(sig_direct, theta, phi, sh, sl_scal, dl_scal, sgn)
-    resid_diag = jnp.linalg.norm(bc_check_direct - BC_pot)
+    vwx_bc = jnp.stack(sig_xyz2vwx(BC_pot[:,:,0], BC_pot[:,:,1], BC_pot[:,:,2], theta, phi, sh), axis=0)
+    vwx_sig = stokes_onsurf_direct_solve(vwx_bc, sh, sl_scal, dl_scal, sgn)
+    vwx_bc_check = bio_onsurf_apply(vwx_sig, sh, sl_scal, dl_scal, sgn)
+    resid_diag = jnp.linalg.norm(vwx_bc_check - vwx_bc)
     print("Residual of DIRECT solve = {a}".format(a=resid_diag))
 
     # Accuracy
-    xtrg = Strg["Xcart"][:,:,0] 
+    xtrg = Strg["Xcart"][:,:,0]
     ytrg = Strg["Xcart"][:,:,1]
     ztrg = Strg["Xcart"][:,:,2]
+    theta_trg = Strg["Xsph"][:,:,0]
+    phi_trg = Strg["Xsph"][:,:,1]
     trg_sphere2 = jnp.column_stack([jnp.reshape(xtrg,-1), jnp.reshape(ytrg,-1), jnp.reshape(ztrg,-1)])
-    true_field = compute_field(trg_sphere2, ptsrc, force) 
-    true_field = jnp.reshape(true_field, S["Xcart"].shape)
+    true_field = compute_field(trg_sphere2, ptsrc, force)
+    true_field = jnp.reshape(true_field, Strg["Xcart"].shape)
     true_field = jnp.real(true_field)
 
-    S = set_density(S, sig_direct[:,:,0], sig_direct[:,:,1], sig_direct[:,:,2])
-    Ksig_direct = point_n_shoot(Strg, shtrg, S, sh, sl_scal, dl_scal)
-    Ksig_direct = jnp.real(Ksig_direct)
+    vwx_out = point_n_shoot(Strg, shtrg, vwx_sig, S, sh, sl_scal, dl_scal)
+    vx, vy, vz = sig_vwx2xyz(vwx_out[0], vwx_out[1], vwx_out[2], theta_trg, phi_trg, shtrg)
+    Ksig_direct = jnp.real(jnp.stack([vx, vy, vz], axis=2))
 
     diff_direct = jnp.max(true_field - Ksig_direct) / jnp.max(true_field)
     print("Max relative error of order {lmax} solver at target radius {Rtrg} for direct solver is {d}".format(lmax=lmax, Rtrg=Rtrg, d=diff_direct))
 
-    # Arbitrary-point spectral eval (bio_offsurf_apply) vs point_n_shoot (to_lat_jax) to check far eval formulas
-    K_pns = jnp.real(jnp.reshape(point_n_shoot(Strg, shtrg, S, sh, sl_scal, dl_scal), (-1, 3)))
-    K_far = jnp.real(bio_offsurf_apply(trg_sphere2, S, sh, sl_scal, dl_scal, far=True))
+    # Arbitrary-point spectral eval (bio_offsurf_apply) vs point_n_shoot (to_lat_jax) to check
+    # far eval formulas. point_n_shoot returns target-basis VWX coeffs, so synthesize them to
+    # Cartesian point values (inverse COB) before comparing against the point-valued far eval.
+    K_pns = jnp.real(jnp.reshape(Ksig_direct, (-1, 3)))
+    K_far = jnp.real(bio_offsurf_apply(trg_sphere2, vwx_sig, S, sh, sl_scal, dl_scal, far=True))
     err_far = jnp.max(jnp.abs(K_far - K_pns)) / jnp.max(jnp.abs(K_pns))
     jax.debug.print("Max relative error of bio_offsurf_apply (far eval) vs point_n_shoot at radius {Rtrg} = {e}", Rtrg=Rtrg, e=err_far)
 
     #  ...  to check SHqst_to_point_cplx
-    K_pt = jnp.real(bio_offsurf_apply(trg_sphere2, S, sh, sl_scal, dl_scal, far=False))
+    K_pt = jnp.real(bio_offsurf_apply(trg_sphere2, vwx_sig, S, sh, sl_scal, dl_scal, far=False))
     err_pt = jnp.max(jnp.abs(K_pt - K_pns)) / jnp.max(jnp.abs(K_pns))
     jax.debug.print("Max relative error of bio_offsurf_apply (point eval) vs point_n_shoot at radius {Rtrg} = {e}", Rtrg=Rtrg, e=err_pt)
 

@@ -48,14 +48,19 @@ def test(lmax, src_c=(0., 0., 0.), src_r=1.0, trg_c=(3.0, 0., 0.), trg_r=0.5, se
     rng = np.random.default_rng(seed)
     nphi, ntheta = S["Xcart"].shape[:2]
     sig = rng.standard_normal((nphi, ntheta, 3)) + 0j
-    S = set_density(S, jnp.asarray(sig[:, :, 0]), jnp.asarray(sig[:, :, 1]), jnp.asarray(sig[:, :, 2]))
+    # density -> VWX coefficients (the coeff-basis evaluator input)
+    vwx = jnp.stack(Stk3d.sig_xyz2vwx(jnp.asarray(sig[:, :, 0]), jnp.asarray(sig[:, :, 1]),
+                                      jnp.asarray(sig[:, :, 2]), S["Xsph"][:, :, 0], S["Xsph"][:, :, 1], sh))
     trg = Strg["Xcart"].reshape(-1, 3)
 
-    base, t_base = _timed(lambda: Stk3d.bio_offsurf_apply(trg, S, sh, sl, dl, far=False))
+    base, t_base = _timed(lambda: Stk3d.bio_offsurf_apply(trg, vwx, S, sh, sl, dl, far=False))
     base = np.asarray(base)
-    pns, t_pns = _timed(lambda: Stk3d.point_n_shoot(Strg, shtrg, S, sh, sl, dl, near=False))
-    pns = np.asarray(pns).reshape(-1, 3)
-    far, t_far = _timed(lambda: Stk3d.bio_offsurf_apply(trg, S, sh, sl, dl, far=True))
+    pns_vwx, t_pns = _timed(lambda: Stk3d.point_n_shoot(Strg, shtrg, vwx, S, sh, sl, dl, near=False))
+    # point_n_shoot returns target-basis VWX coeffs; recompose to Cartesian points to compare
+    pvx, pvy, pvz = Stk3d.sig_vwx2xyz(pns_vwx[0], pns_vwx[1], pns_vwx[2],
+                                      Strg["Xsph"][:, :, 0], Strg["Xsph"][:, :, 1], shtrg)
+    pns = np.asarray(jnp.stack([pvx, pvy, pvz], axis=2)).reshape(-1, 3)
+    far, t_far = _timed(lambda: Stk3d.bio_offsurf_apply(trg, vwx, S, sh, sl, dl, far=True))
     far = np.asarray(far)
 
     denom = np.max(np.abs(base))

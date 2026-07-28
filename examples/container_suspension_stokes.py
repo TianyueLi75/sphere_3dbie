@@ -128,10 +128,13 @@ def main():
         trg_in = jnp.asarray(trg_grid[inside])
         approx = jnp.zeros((trg_in.shape[0], 3), dtype=jnp.complex128)
         for s in range(Ns):
-            nphi, ntheta = Sp["spheres_lst"][s]["Xcart"].shape[:2]
+            s_sph = Sp["spheres_lst"][s]
+            nphi, ntheta = s_sph["Xcart"].shape[:2]
             sig_s = sigma[3 * int(dsp[s]):3 * int(dsp[s + 1])].reshape(nphi, ntheta, 3)
-            s_sph = set_density(Sp["spheres_lst"][s], sig_s[:, :, 0], sig_s[:, :, 1], sig_s[:, :, 2])
-            approx = approx + Stk3d.bio_offsurf_apply(trg_in, s_sph, sh_lst[s], sl_lst[s], dl_lst[s])
+            # density -> VWX coefficients (the coeff-basis bio_offsurf_apply input)
+            vwx_s = jnp.stack(Stk3d.sig_xyz2vwx(sig_s[:, :, 0], sig_s[:, :, 1], sig_s[:, :, 2],
+                                                s_sph["Xsph"][:, :, 0], s_sph["Xsph"][:, :, 1], sh_lst[s]))
+            approx = approx + Stk3d.bio_offsurf_apply(trg_in, vwx_s, s_sph, sh_lst[s], sl_lst[s], dl_lst[s])
         Ufield[inside] = np.real(np.asarray(approx))
 
     # --- Write VTK ---

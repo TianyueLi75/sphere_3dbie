@@ -59,15 +59,17 @@ def test(lmax: int, exterior: bool = True):
     BC_pot = compute_field(trg_sphere, ptsrc, force)
     BC_pot = jnp.reshape(BC_pot, S["Xcart"].shape)
 
-    sig_direct = stokes_onsurf_direct_solve(BC_pot, theta, phi, sh, sl_scal, dl_scal, sgn)
+    # densities live in the VWX (diagonalizing) basis: COB the BC before the solve
+    vwx_bc = jnp.stack(sig_xyz2vwx(BC_pot[:, :, 0], BC_pot[:, :, 1], BC_pot[:, :, 2], theta, phi, sh))
+    sig_direct = stokes_onsurf_direct_solve(vwx_bc, sh, sl_scal, dl_scal, sgn)
     jax.block_until_ready(sig_direct)   # warmup: finish compile before timing
     tstart = time.time()
-    sig_direct = stokes_onsurf_direct_solve(BC_pot, theta, phi, sh, sl_scal, dl_scal, sgn)
+    sig_direct = stokes_onsurf_direct_solve(vwx_bc, sh, sl_scal, dl_scal, sgn)
     jax.block_until_ready(sig_direct)
     tend = time.time()
     time_direct = tend - tstart
-    bc_check_direct = bio_onsurf_apply(sig_direct, theta, phi, sh, sl_scal, dl_scal, sgn)
-    resid_direct = jnp.linalg.norm(bc_check_direct - BC_pot)
+    bc_check_direct = bio_onsurf_apply(sig_direct, sh, sl_scal, dl_scal, sgn)
+    resid_direct = jnp.linalg.norm(bc_check_direct - vwx_bc)
     print("Residual of DIRECT solve = {a}".format(a=resid_direct))
 
     # Accuracy
@@ -79,15 +81,18 @@ def test(lmax: int, exterior: bool = True):
     true_field = jnp.reshape(true_field, Strg["Xcart"].shape)
     true_field = jnp.real(true_field)
 
-    S = set_density(S, sig_direct[:,:,0], sig_direct[:,:,1], sig_direct[:,:,2])
-    Ksig_direct = point_n_shoot(Strg, shtrg, S, sh, sl_scal, dl_scal)  # warmup
-    jax.block_until_ready(Ksig_direct)
+    # sig_direct are the source VWX coefficients; point_n_shoot takes/returns coefficients.
+    Ksig_vwx = point_n_shoot(Strg, shtrg, sig_direct, S, sh, sl_scal, dl_scal)  # warmup
+    jax.block_until_ready(Ksig_vwx)
     tstart = time.time()
-    Ksig_direct = point_n_shoot(Strg, shtrg, S, sh, sl_scal, dl_scal)
-    jax.block_until_ready(Ksig_direct)
+    Ksig_vwx = point_n_shoot(Strg, shtrg, sig_direct, S, sh, sl_scal, dl_scal)
+    jax.block_until_ready(Ksig_vwx)
     tend = time.time()
     time_eval = tend - tstart
-    Ksig_direct = jnp.real(Ksig_direct)
+    # point_n_shoot returns target-basis VWX coeffs; recompose to Cartesian for the error
+    vx, vy, vz = sig_vwx2xyz(Ksig_vwx[0], Ksig_vwx[1], Ksig_vwx[2],
+                             Strg["Xsph"][:, :, 0], Strg["Xsph"][:, :, 1], shtrg)
+    Ksig_direct = jnp.real(jnp.stack([vx, vy, vz], axis=2))
 
     err_direct = jnp.max(jnp.abs(true_field - Ksig_direct)) / jnp.max(jnp.abs(true_field))
     print("Max relative error of order {lmax} solver at target radius {Rtrg} for direct solver is {d}".format(lmax=lmax, Rtrg=Rtrg, d=err_direct))

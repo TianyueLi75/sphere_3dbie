@@ -42,66 +42,46 @@ def test(lmax: int):
     BC_pot = compute_potential(trg_sphere, ptsrc, force)
     BC_pot = jnp.reshape(BC_pot, x.shape)
 
-    # GMRES solve
+    # GMRES solve -- operates in the SH (diagonalizing) basis: COB the BC to coefficients, solve
+    # the coeff->coeff operator, keep the density as coefficients (recomposed only for the error).
+    qlm_bc = sh.analys_cplx_jax(BC_pot)
+    struct = jax.eval_shape(lambda: jnp.zeros((sh.nlm_cplx,), dtype=jnp.complex128))
     LapK_apply = partial(
         bio_onsurf_apply,
         sh=sh,
-        sl_scal=sl_scal, 
-        dl_scal=dl_scal, 
+        sl_scal=sl_scal,
+        dl_scal=dl_scal,
         sgn=sgn
     )
-    gmres_func = lx.FunctionLinearOperator(
-        LapK_apply, jax.eval_shape(lambda: jnp.zeros(x.shape, dtype=jnp.complex128))
-    )
+    gmres_func = lx.FunctionLinearOperator(LapK_apply, struct)
     solver = lx.GMRES(rtol=1e-10, atol=1e-12, max_steps=200)
+    opts = {"y0": jnp.zeros((sh.nlm_cplx,), dtype=jnp.complex128)}
 
-    solution = lx.linear_solve(
-        gmres_func,
-        BC_pot,
-        solver=solver,
-        options={"y0": jnp.zeros(x.shape, dtype=jnp.complex128)},
-    )
+    solution = lx.linear_solve(gmres_func, qlm_bc, solver=solver, options=opts)
     jax.block_until_ready(solution.value)   # warmup: finish compile before timing
     tstart = time.time()
-    solution = lx.linear_solve(
-        gmres_func,
-        BC_pot,
-        solver=solver,
-        options={"y0": jnp.zeros(x.shape, dtype=jnp.complex128)},
-    )
+    solution = lx.linear_solve(gmres_func, qlm_bc, solver=solver, options=opts)
     jax.block_until_ready(solution.value)
     tend = time.time()
     time_gmres = tend - tstart
 
-    sig_gmres = solution.value 
+    sig_gmres = solution.value                   # SH coefficients
     stats = solution.stats
     bc_check = bio_onsurf_apply(sig_gmres, sh, sl_scal, dl_scal, sgn)
-    resid_gmres = jnp.linalg.norm(bc_check - BC_pot)
+    resid_gmres = jnp.linalg.norm(bc_check - qlm_bc)
     jax.debug.print("Residual of GMRES solve = {a}, number of iterations = {b}", a=resid_gmres, b=stats["num_steps"])
 
-    # DIRECT solve
-    sig_direct = bio_onsurf_direct_solve(
-        bc_pot=BC_pot,
-        sh=sh,
-        sl_scal=sl_scal,
-        dl_scal=dl_scal,
-        sgn=sgn
-    )
+    # DIRECT solve (coeff -> coeff)
+    sig_direct = bio_onsurf_direct_solve(qlm_bc, sh=sh, sl_scal=sl_scal, dl_scal=dl_scal, sgn=sgn)
     jax.block_until_ready(sig_direct)   # warmup: finish compile before timing
     tstart = time.time()
-    sig_direct = bio_onsurf_direct_solve(
-        bc_pot=BC_pot,
-        sh=sh,
-        sl_scal=sl_scal,
-        dl_scal=dl_scal,
-        sgn=sgn
-    )
+    sig_direct = bio_onsurf_direct_solve(qlm_bc, sh=sh, sl_scal=sl_scal, dl_scal=dl_scal, sgn=sgn)
     jax.block_until_ready(sig_direct)
     tend = time.time()
     time_direct = tend - tstart
 
     bc_check_direct = bio_onsurf_apply(sig_direct, sh, sl_scal, dl_scal, sgn)
-    resid_direct = jnp.linalg.norm(bc_check_direct - BC_pot)
+    resid_direct = jnp.linalg.norm(bc_check_direct - qlm_bc)
     jax.debug.print("Residual of DIRECT solve: {a}", a=resid_direct)
 
     # Accuracy
@@ -112,18 +92,20 @@ def test(lmax: int):
     true_pot = compute_potential(trg_sphere2, ptsrc, force)
     true_pot = jnp.real(true_pot)
 
-    S = set_density(S, sig_gmres)
-    Ksig_gmres = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
+    # bio_offsurf_apply_1sph takes source coeffs and returns target-grid potential coeffs;
+    # synthesize to the grid for the error (timed together, matching the old grid-space eval).
+    qlm_out = bio_offsurf_apply_1sph(Strg, shtrg, sig_gmres, S, sh, sl_scal, dl_scal)
+    Ksig_gmres = shtrg.synth_cplx_jax(qlm_out)
     jax.block_until_ready(Ksig_gmres)   # warmup eval: finish compile before the timed direct eval
-    Ksig_gmres = jnp.real(jnp.reshape(Ksig_gmres,(-1,1)))
+    Ksig_gmres = jnp.real(jnp.reshape(Ksig_gmres, (-1, 1)))
 
-    S = set_density(S, sig_direct)
     tstart = time.time()
-    Ksig_direct = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
+    qlm_out = bio_offsurf_apply_1sph(Strg, shtrg, sig_direct, S, sh, sl_scal, dl_scal)
+    Ksig_direct = shtrg.synth_cplx_jax(qlm_out)
     Ksig_direct.block_until_ready()
     tend = time.time()
     time_eval = tend - tstart
-    Ksig_direct = jnp.real(jnp.reshape(Ksig_direct,(-1,1)))
+    Ksig_direct = jnp.real(jnp.reshape(Ksig_direct, (-1, 1)))
 
     err_gmres = jnp.max(jnp.abs(true_pot - Ksig_gmres)) / jnp.max(jnp.abs(true_pot))
     err_direct = jnp.max(jnp.abs(true_pot - Ksig_direct)) / jnp.max(jnp.abs(true_pot))

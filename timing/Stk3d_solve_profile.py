@@ -5,7 +5,7 @@ cost is a sum of three cross-evaluation strategies with DIFFERENT lmax scaling:
 
   - self blocks (Stk3d.bio_onsurf_apply)          -- shtns analysis/synthesis, O(lmax^3)
   - near cross  (point-and-shoot, ps_evals)       -- Wigner rotations + per-ring FFT, O(lmax^3)
-  - far  cross  (direct Nystrom sum, far_evals)   -- dense Ntrg x Nsrc broadcast, O(lmax^4)
+  - far  cross  (direct Nystrom sum, far_evals)   -- dense Ntrg x Nsrc pair sum, O(lmax^4)
 
 plus the block-Jacobi preconditioner (O(lmax^3)/sphere) and a GMRES iteration count that
 itself grows with lmax. Grid size is Nnodes = nphi*ntheta = O(lmax^2), so N = 3*Nnodes.
@@ -132,80 +132,78 @@ def time_first_vs_steady(fn, arg):
 # component matvec pieces (each mirrors exactly what Stk3d_onsurf_apply does for that term)
 # ----------------------------------------------------------------------------------------
 def make_components(Sp, Ns, sh_lst, sl_lst, dl_lst, sgn_lst, ps_evals, far_evals):
-    """Build jitted callables for each isolated cost center + the full matvec. Empty
-    cross-term dicts (e.g. no far pairs in the near geometry) yield None (reported as NaN)."""
+    """Build jitted callables for each isolated cost center + the full matvec. All operate in
+    COEFFICIENT space (matching Stk3d_onsurf_apply): the test vector is the concatenation of each
+    sphere's stacked-VWX coeffs. Empty cross dicts (no near/far pairs) yield None (reported NaN).
+    Returns (components, Ncoef)."""
     spheres = Sp["spheres_lst"]
-    bounds = _block_bounds3(Sp, Ns)
-    N = bounds[-1][1]
+    bounds = _block_bounds3(Sp, Ns)          # grid ranges (used by the far scatter)
+    Ngrid = bounds[-1][1]
+    cb, c0 = [], 0
+    for s in range(Ns):
+        n = 3 * sh_lst[s].nlm_cplx; cb.append((c0, c0 + n)); c0 += n
+    Ncoef = c0
+
+    def _blocks(c):   # flat coeff vector -> list of per-sphere (3, nlm) VWX blocks
+        return [c[cb[s][0]:cb[s][1]].reshape(3, sh_lst[s].nlm_cplx) for s in range(Ns)]
 
     @jax.jit
-    def self_only(sigma):
-        ylist = []
-        for tind in range(Ns):
-            t_sph = spheres[tind]
-            nphi_t, ntheta_t = t_sph["Xcart"].shape[:2]
-            st, sp = bounds[tind]
-            sigma_t = sigma[st:sp].reshape(nphi_t, ntheta_t, 3)
-            acc = Stk3d.bio_onsurf_apply(
-                sigma_t, t_sph["Xsph"][:, :, 0], t_sph["Xsph"][:, :, 1], sh_lst[tind],
-                sl_lst[tind], dl_lst[tind], sgn_lst[tind], radius=t_sph["r"]).reshape(-1)
-            ylist.append(acc)
-        return jnp.concatenate(ylist)
+    def self_only(c):
+        vb = _blocks(c)
+        return jnp.concatenate([
+            Stk3d.bio_onsurf_apply(vb[t], sh_lst[t], sl_lst[t], dl_lst[t], sgn_lst[t],
+                                   radius=spheres[t]["r"]).reshape(-1)
+            for t in range(Ns)])
 
     near_only = None
     if ps_evals:
         @jax.jit
-        def near_only(sigma):
-            ylist = []
+        def near_only(c):
+            vb = _blocks(c); out = []
             for tind in range(Ns):
-                st, sp = bounds[tind]
-                acc = jnp.zeros(sp - st, dtype=jnp.complex128)
+                acc = jnp.zeros((3, sh_lst[tind].nlm_cplx), dtype=jnp.complex128)
                 for sind in range(Ns):
                     if (tind, sind) in ps_evals:
-                        ss, se = bounds[sind]
-                        nphi_s, ntheta_s = spheres[sind]["Xcart"].shape[:2]
-                        sigma_s = sigma[ss:se].reshape(nphi_s, ntheta_s, 3)
-                        acc = acc + ps_evals[(tind, sind)](
-                            sigma_s, sl_lst[sind], dl_lst[sind]).reshape(-1)
-                ylist.append(acc)
-            return jnp.concatenate(ylist)
+                        acc = acc + ps_evals[(tind, sind)](vb[sind], sl_lst[sind], dl_lst[sind])
+                out.append(acc.reshape(-1))
+            return jnp.concatenate(out)
 
     far_only = None
     if far_evals:
         @jax.jit
-        def far_only(sigma):
+        def far_only(c):
+            vb = _blocks(c)
             u_all = jnp.concatenate([
-                far_evals[sind][0](
-                    sigma[bounds[sind][0]:bounds[sind][1]].reshape(
-                        *spheres[sind]["Xcart"].shape[:2], 3),
-                    sl_lst[sind], dl_lst[sind]).reshape(-1)
+                far_evals[sind][0](vb[sind], sl_lst[sind], dl_lst[sind]).reshape(-1)
                 for sind in far_evals])
             dest_all = jnp.concatenate([dest for (_, dest) in far_evals.values()])
-            return jnp.zeros(N, dtype=jnp.complex128).at[dest_all].add(u_all)
+            far_grid = jnp.zeros(Ngrid, dtype=jnp.complex128).at[dest_all].add(u_all)
+            out = []
+            for tind in range(Ns):
+                t_sph = spheres[tind]; nphi_t, ntheta_t = t_sph["Xcart"].shape[:2]
+                th_t, ph_t = t_sph["Xsph"][:, :, 0], t_sph["Xsph"][:, :, 1]
+                gt = far_grid[bounds[tind][0]:bounds[tind][1]].reshape(nphi_t, ntheta_t, 3)
+                out.append(jnp.stack(Stk3d.sig_xyz2vwx(
+                    gt[:, :, 0], gt[:, :, 1], gt[:, :, 2], th_t, ph_t, sh_lst[tind])).reshape(-1))
+            return jnp.concatenate(out)
 
     @jax.jit
-    def precond(r):
-        r = r.reshape(-1)
-        zlist = []
+    def precond(c):
+        vb = _blocks(c); out = []
         for sind in range(Ns):
-            s_sph = spheres[sind]
-            nphi, ntheta = s_sph["Xcart"].shape[:2]
-            ss, se = bounds[sind]
             if float(sgn_lst[sind]) < 0.0:      # interior block: identity (see solve docstring)
-                zlist.append(r[ss:se]); continue
-            zs = Stk3d.stokes_onsurf_direct_solve(
-                r[ss:se].reshape(nphi, ntheta, 3), s_sph["Xsph"][:, :, 0], s_sph["Xsph"][:, :, 1],
-                sh_lst[sind], sl_lst[sind], dl_lst[sind], sgn_lst[sind], radius=s_sph["r"])
-            zlist.append(zs.reshape(-1))
-        return jnp.concatenate(zlist)
+                out.append(vb[sind].reshape(-1)); continue
+            vz = Stk3d.stokes_onsurf_direct_solve(
+                vb[sind], sh_lst[sind], sl_lst[sind], dl_lst[sind], sgn_lst[sind], radius=spheres[sind]["r"])
+            out.append(vz.reshape(-1))
+        return jnp.concatenate(out)
 
     @jax.jit
-    def full_matvec(sigma):
-        return Stk3d_onsurf_apply(sigma, Sp, Ns, sh_lst, sl_lst, dl_lst, sgn_lst,
-                                  ps_evals, far_evals)
+    def full_matvec(c):
+        return Stk3d_onsurf_apply(c, Sp, Ns, sh_lst, sl_lst, dl_lst, sgn_lst, ps_evals, far_evals)
 
     return {"self": self_only, "near": near_only, "far": far_only,
-            "precond": precond, "matvec": full_matvec}, N
+            "precond": precond, "matvec": full_matvec}, Ncoef
 
 
 # ----------------------------------------------------------------------------------------

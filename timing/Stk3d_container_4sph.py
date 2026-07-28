@@ -112,10 +112,12 @@ def test(lmax: int, chk: jax.Array, mode: str):
     t0 = time.time()
     approx = jnp.zeros((chk.shape[0], 3), dtype=jnp.complex128)
     for s in range(Ns):
-        nphi, ntheta = Sp["spheres_lst"][s]["Xcart"].shape[:2]
+        s_sph = Sp["spheres_lst"][s]
+        nphi, ntheta = s_sph["Xcart"].shape[:2]
         sig_s = sigma[3 * int(dsp[s]): 3 * int(dsp[s + 1])].reshape(nphi, ntheta, 3)
-        s_sph = set_density(Sp["spheres_lst"][s], sig_s[:, :, 0], sig_s[:, :, 1], sig_s[:, :, 2])
-        approx = approx + Stk3d.bio_offsurf_apply(chk, s_sph, sh_lst[s], sl_lst[s], dl_lst[s])
+        vwx_s = jnp.stack(Stk3d.sig_xyz2vwx(sig_s[:, :, 0], sig_s[:, :, 1], sig_s[:, :, 2],
+                                            s_sph["Xsph"][:, :, 0], s_sph["Xsph"][:, :, 1], sh_lst[s]))
+        approx = approx + Stk3d.bio_offsurf_apply(chk, vwx_s, s_sph, sh_lst[s], sl_lst[s], dl_lst[s])
     u_chk = np.real(np.asarray(approx))
     t_eval = time.time() - t0
 

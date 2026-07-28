@@ -48,88 +48,140 @@ def Lap3d_dsl_diag(sh: shtns_jax.sht) -> tuple([jax.Array, jax.Array]):
     diag_ext = - (l_vals + 1) / (2.0 * l_vals + 1.0)
     return diag_ext, diag_int
 
-def Lap3d_sl_far(trg: jax.Array, S:SphereDict, sh: shtns_jax.sht) -> jax.Array:
+LAP_FAR_PREFAC = 1.0 / 4.0 / jnp.pi
+
+@partial(jax.jit, static_argnames=["sh", "tile", "terms"])
+def _lap_far_kernel(trg: jax.Array, qlm_sigma: jax.Array, trgN: jax.Array,
+                    sl_scal, dl_scal, dsl_scal,
+                    Y: jax.Array, w: jax.Array, a, Xc: jax.Array,
+                    sh: shtns_jax.sht, tile: int, terms: tuple) -> jax.Array:
     """
-    Off-surface evaluation of the Lap3d SL potential with S["Sigma"]
+    Fused smooth-quadrature ("far") evaluation of  K = sl*SL + dl*DL + dsl*dSL  of the
+    source sphere described by <Y>, <w>, <a>, <Xc> (see sphere.far_src_geom) with scalar
+    density coefficients <qlm_sigma>, at targets <trg> (Ntrg x 3) with target normals
+    <trgN> (only read by the dSL term).  Returns Ntrg x 1 potential values.
+    <terms> selects which operators are built at all (static, so an unused operator costs
+    nothing); the scalings stay traced.
+
+    All three kernels are dense sums over the Ntrg x Nsrc pairs, so the whole cost is in how
+    much per-pair work is done. Writing r = x_i - Y_j with x_i = trg_i - Xc, and using that
+    the source normal on a sphere is exactly n_j = Y_j / a:
+
+        d2 = |x_i|^2 - 2 x_i.Y_j + a^2        (one K=3 gemm; no Ntrg x Nsrc x 3 temporary)
+        r.n_j = (x_i.Y_j - a^2)/a = (|x_i|^2 - a^2 - d2)/(2a)
+
+    so the DL radial factor collapses onto quantities SL already needs:
+        invd3*(r.n) = [ (|x_i|^2 - a^2) invd3 - invd ] / (2a).
+    Both operators are then just contractions of the two pair matrices invd, invd3 against
+    the source-side density columns -- no pow(), no sqrt beyond one rsqrt, and every
+    pair-shaped array stays REAL (the complex density enters only through the narrow column
+    blocks, real and imaginary parts carried side by side, since the sum is linear in it).
+    dSL keeps a per-target normal so its r.n does not collapse, but
+        sum_j invd3 (Y_j.n_x_i) g_j = n_x_i . sum_j invd3 Y_j g_j
+    turns that into three extra source columns rather than another pair matrix.
+    """
+    f = sh.synth_cplx_jax(qlm_sigma).reshape(-1)   # coeffs -> grid, once
+    g = w * f                                      # (Nsrc,) weighted density
+    a2 = a * a
+    want_sl, want_dl, want_dsl = ("sl" in terms), ("dl" in terms), ("dsl" in terms)
+    # Source column blocks, real/imag side by side (the density is complex but the sum is
+    # linear in it, so it rides along as extra columns and every pair array stays real).
+    Z1 = jnp.stack([jnp.real(g), jnp.imag(g)], axis=1)              # (Nsrc, 2)
+    if want_dsl:
+        gY = g[:, None] * Y                                         # (Nsrc, 3)
+        ZY = jnp.concatenate([jnp.real(gY), jnp.imag(gY)], axis=1)  # (Nsrc, 6)
+
+    def body(tt, nn):
+        X = tt - Xc                                                 # (nt, 3)
+        px = jnp.sum(X * X, axis=1)[:, None]                        # (nt, 1)
+        d2 = jnp.maximum(px + a2 - 2.0 * pair_dot(X, Y), 0.0)        # (nt, Nsrc)
+        invd = jax.lax.rsqrt(d2)
+        if want_dl or want_dsl:
+            invd3 = invd * invd * invd
+        # SL, DL and the (r.n_x)-free part of dSL are all  sum_j <radial factor> g_j, so they
+        # collapse into ONE pair matrix -- the per-target factors multiply the radial powers,
+        # not the contraction result.
+        pair = 0.0
+        if want_sl:
+            pair = pair + sl_scal * invd
+        if want_dl:
+            pair = pair + dl_scal * (((px - a2) / (2.0 * a)) * invd3 - invd / (2.0 * a))
+        if want_dsl:
+            pair = pair - dsl_scal * jnp.sum(X * nn, axis=1)[:, None] * invd3
+        R = (LAP_FAR_PREFAC * pair) @ Z1
+        out = R[:, 0] + 1j * R[:, 1]
+        if want_dsl:
+            # the remaining dSL piece: sum_j invd3 (Y_j.n_x_i) g_j = n_x_i . sum_j invd3 Y_j g_j
+            RY = invd3 @ ZY
+            V3 = RY[:, 0:3] + 1j * RY[:, 3:6]
+            out = out + (dsl_scal * LAP_FAR_PREFAC) * jnp.sum(nn * V3, axis=1)
+        return out[:, None]
+
+    if trgN is None:
+        trgN = jnp.zeros_like(trg)
+    return far_tile_map(body, (trg, trgN), tile)
+
+def _lap_far(trg: jax.Array, qlm_sigma: jax.Array, S: SphereDict, sh: shtns_jax.sht,
+             terms: tuple, sl_scal=0.0, dl_scal=0.0, dsl_scal=0.0,
+             trgN: jax.Array = None, tile: int = None) -> jax.Array:
+    """Eager wrapper of _lap_far_kernel: pulls the source-centred geometry out of <S> and
+    picks the target tile size, then calls the jitted kernel."""
+    Y, w, a, Xc = far_src_geom(S, sh)
+    return _lap_far_kernel(trg, qlm_sigma, trgN, sl_scal, dl_scal, dsl_scal, Y, w, a, Xc,
+                           sh=sh, tile=far_tile_size(Y.shape[0], tile), terms=terms)
+
+def Lap3d_sl_far(trg: jax.Array, qlm_sigma: jax.Array, S:SphereDict, sh: shtns_jax.sht) -> jax.Array:
+    """
+    Off-surface evaluation of the Lap3d SL potential with density coefficients <qlm_sigma>
         with <trg>: Ntrg x 3
         using the smooth surface quadrature (accurate only for targets well
         away from the surface).
+    The direct quadrature needs the grid-space density, so the coefficients are first
+    synthesized back to the (nphi, ntheta) grid (inverse decomposition), then the direct
+    matrix integral is applied.
     Returns the potential at the targets: Ntrg x 1.
+    Thin wrapper over the fused _lap_far kernel (see there for the quadrature).
     """
     assert trg.shape[1] == 3
+    return _lap_far(trg, qlm_sigma, S, sh, ("sl",), sl_scal=1.0)
 
-    # Flatten the (nphi, ntheta, ...) grid arrays to per-source-point lists.
-    grid_shape = S["Xcart"].shape[:2]
-    ysrc = S["Xcart"].reshape(-1, 3)        # Nsrc x 3
-    fsrc = S["Sigma"][:, :, 0].reshape(-1)  # Nsrc
-    # Gauss weights (1 x ntheta) broadcast over the (nphi, ntheta) grid, plus
-    # the r^2 surface Jacobian for a sphere of radius S["r"].
-    wts = jnp.broadcast_to(sh._grid_weights(), grid_shape).reshape(-1) * S["r"] ** 2
-
-    r = trg[:, None, :] - ysrc[None, :, :]  # Ntrg x Nsrc x 3, convention r = trg - src
-    invd = 1.0 / jnp.linalg.norm(r, axis=2) # Ntrg x Nsrc
-    prefac = 1.0 / 4.0 / jnp.pi
-    SL_sigma = prefac * jnp.sum(invd * (wts * fsrc)[None, :], axis=1)
-    return SL_sigma[:, None]
-
-def Lap3d_dl_far(trg: jax.Array, S:SphereDict, sh: shtns_jax.sht) -> jax.Array:
+def Lap3d_dl_far(trg: jax.Array, qlm_sigma: jax.Array, S:SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
-    Off-surface evaluation of the Lap3d DL potential with S["Sigma"]
+    Off-surface evaluation of the Lap3d DL potential with density coefficients <qlm_sigma>
         with <trg>: Ntrg x 3
         using the smooth surface quadrature (accurate only for targets well
-        away from the surface).
+        away from the surface). The coefficients are synthesized to the grid first,
+        then the direct matrix integral is applied.
     Returns the potential at the targets: Ntrg x 1.
 
     The DL kernel is d/dn_y (1/(4 pi |x-y|)) = (1/4pi) (x-y).n_y / |x-y|^3.
     With r = trg - src = x - y, this is prefac * (r.n) / |r|^3.
+    Thin wrapper over the fused _lap_far kernel (see there for the quadrature).
     """
     assert trg.shape[1] == 3
+    return _lap_far(trg, qlm_sigma, S, sh, ("dl",), dl_scal=1.0)
 
-    grid_shape = S["Xcart"].shape[:2]
-    ysrc = S["Xcart"].reshape(-1, 3)        # Nsrc x 3
-    fsrc = S["Sigma"][:, :, 0].reshape(-1)  # Nsrc
-    ynsrc = S["Xncart"].reshape(-1, 3)      # Nsrc x 3, unit outward normals
-    wts = jnp.broadcast_to(sh._grid_weights(), grid_shape).reshape(-1) * S["r"] ** 2
-
-    r = trg[:, None, :] - ysrc[None, :, :]  # Ntrg x Nsrc x 3, convention r = trg - src
-    d = jnp.linalg.norm(r, axis=2)          # Ntrg x Nsrc
-    invd3 = 1.0 / (d * d * d)
-    rdotn = jnp.sum(r * ynsrc[None, :, :], axis=2)  # Ntrg x Nsrc
-    prefac = 1.0 / 4.0 / jnp.pi
-    DL_sigma = prefac * jnp.sum(invd3 * rdotn * (wts * fsrc)[None, :], axis=1)
-    return DL_sigma[:, None]
-
-def Lap3d_dsl_far(trg: jax.Array, trgN: jax.Array, S:SphereDict, sh: shtns_jax.sht) -> jax.Array:
+def Lap3d_dsl_far(trg: jax.Array, trgN: jax.Array, qlm_sigma: jax.Array, S:SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
     Off-surface evaluation of the surface-normal derviatve of the Lap3d SL potential ("T")
         with <trg>: Ntrg x 3
         against target normal <trgN>: Ntrg x 3
         using the smooth surface quadrature (accurate only for targets well
-        away from the surface).
+        away from the surface). Density given by coefficients <qlm_sigma>, synthesized
+        to the grid first, then the direct matrix integral is applied.
     Returns the traction at the targets: Ntrg x 1.
 
     The SL traction kernel is -(1/4pi) (x-y).n_x / |x-y|^3.
     With r = trg - src = x - y
+    Thin wrapper over the fused _lap_far kernel (see there for the quadrature).
     """
     assert trg.shape[1] == 3 and trgN.shape[1] == 3
+    return _lap_far(trg, qlm_sigma, S, sh, ("dsl",), dsl_scal=1.0, trgN=trgN)
 
-    grid_shape = S["Xcart"].shape[:2]
-    ysrc = S["Xcart"].reshape(-1, 3)        # Nsrc x 3
-    fsrc = S["Sigma"][:, :, 0].reshape(-1)  # Nsrc
-    wts = jnp.broadcast_to(sh._grid_weights(), grid_shape).reshape(-1) * S["r"] ** 2
-
-    r = trg[:, None, :] - ysrc[None, :, :]  # Ntrg x Nsrc x 3, convention r = trg - src
-    d = jnp.linalg.norm(r, axis=2)          # Ntrg x Nsrc
-    invd3 = 1.0 / (d * d * d)
-    rdotn = jnp.sum(r * trgN[None, :, :], axis=2)  # Ntrg x Nsrc
-    prefac = - 1.0 / 4.0 / jnp.pi
-    T_sigma = prefac * jnp.sum(invd3 * rdotn * (wts * fsrc)[None, :], axis=1)
-    return T_sigma[:, None]
-
-def Lap3d_sl(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
+def Lap3d_sl(trg: jax.Array, qlm_sigma: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
     Off-surface evaluation at points <trg>: Ntrg x 3
-        From source <S> with density <S["Sigma"]>
+        From source <S> with density coefficients <qlm_sigma> in the SH basis
         source uses SHT object <sh>
     """
 
@@ -138,9 +190,6 @@ def Lap3d_sl(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     if S["lmax"] != sh.lmax:
         print("S lmax does not match sht's lmax, reform sht.")
         sh = shtns_jax.sht(S["lmax"], S["lmax"])
-
-    Sigma = S["Sigma"][:,:,0] 
-    qlm_sigma = sh.analys_cplx_jax(Sigma)
 
     Ntrg = trg.shape[0]
     trg_dx = trg[:,0] - S["Xc"][0]
@@ -176,10 +225,10 @@ def Lap3d_sl(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
 
     return SL_sigma
 
-def Lap3d_dl(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
+def Lap3d_dl(trg: jax.Array, qlm_sigma: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
     Off-surface evaluation at points <trg>: Ntrg x 3
-        From source <S> with density <S["Sigma"]>
+        From source <S> with density coefficients <qlm_sigma> in the SH basis
         source uses SHT object <sh>
     """
 
@@ -188,9 +237,6 @@ def Lap3d_dl(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     if S["lmax"] != sh.lmax:
         print("S lmax does not match sht's lmax, reform sht.")
         sh = shtns_jax.sht(S["lmax"])
-
-    Sigma = S["Sigma"][:,:,0] # scalar operator, so only take Sigma_x
-    qlm_sigma = sh.analys_cplx_jax(Sigma)
 
     Ntrg = trg.shape[0]
     trg_dx = trg[:,0] - S["Xc"][0]
@@ -224,10 +270,10 @@ def Lap3d_dl(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
 
     return DL_sigma
 
-def Lap3d_dsl(trg: jax.Array, trgN: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
+def Lap3d_dsl(trg: jax.Array, trgN: jax.Array, qlm_sigma: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
     Off-surface evaluation at points <trg>: Ntrg x 3 with target normal <trgN>: Ntrg x 3
-        From source <S> with density <S["Sigma"]>
+        From source <S> with density coefficients <qlm_sigma> in the SH basis
         source uses SHT object <sh>
     """
 
@@ -236,9 +282,6 @@ def Lap3d_dsl(trg: jax.Array, trgN: jax.Array, S: SphereDict, sh: shtns_jax.sht)
     if S["lmax"] != sh.lmax:
         print("S lmax does not match sht's lmax, reform sht.")
         sh = shtns_jax.sht(S["lmax"])
-
-    Sigma = S["Sigma"][:,:,0] # scalar operator, so only take Sigma_x
-    qlm_sigma = sh.analys_cplx_jax(Sigma)
 
     Ntrg = trg.shape[0]
     trg_dx = trg[:,0] - S["Xc"][0]
@@ -273,11 +316,12 @@ def Lap3d_dsl(trg: jax.Array, trgN: jax.Array, S: SphereDict, sh: shtns_jax.sht)
     return T_sigma
 
 @partial(jax.jit, static_argnames=["sh", "shtrg", "exterior"])
-def _lap_sl_1sph_kernel(Sigma: jax.Array, a: float, trg_dr: float,
+def _lap_sl_1sph_kernel(qlm_sigma: jax.Array, a: float, trg_dr: float,
                         sh: shtns_jax.sht, shtrg: shtns_jax.sht, exterior: bool) -> jax.Array:
-    """Jitted core of Lap3d_sl_r_1sph. <exterior> (the trg_dr > a branch) and the
-    nlm pad/truncate are compile-time constants (static args)."""
-    qlm_sigma = sh.analys_cplx_jax(Sigma)
+    """Jitted core of Lap3d_sl_r_1sph. Takes the source density coefficients <qlm_sigma>
+    and returns the SL potential coefficients on the target grid (in the SH basis).
+    <exterior> (the trg_dr > a branch) and the nlm pad/truncate are compile-time
+    constants (static args)."""
     rho = trg_dr / a          # solid harmonics as if src sphere were unit; SL scales by a
     l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
     diag = Lap3d_sl_diag(sh)
@@ -292,13 +336,14 @@ def _lap_sl_1sph_kernel(Sigma: jax.Array, a: float, trg_dr: float,
     elif nlm_trg < nlm_src:
         qlm_SL_sigma = qlm_SL_sigma[:nlm_trg]
 
-    return shtrg.synth_cplx_jax(qlm_SL_sigma)
+    return qlm_SL_sigma
 
-def Lap3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
+def Lap3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, qlm_sigma: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
     Off-surface evaluation at a spherical grid of targets
-        From source <S> with density <S["Sigma"]>, source uses SHT object <sh>
+        From source <S> with density coefficients <qlm_sigma> (SH basis), source uses <sh>
         To target <Strg>, target uses SHT object <shtrg>
+    Returns the SL potential coefficients on the target grid (SH basis).
     """
 
     if S["lmax"] != sh.lmax:
@@ -309,14 +354,15 @@ def Lap3d_sl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: s
         shtrg = shtns_jax.sht(Strg["lmax"], Strg["lmax"])
 
     exterior = bool(Strg["r"] > S["r"])
-    return _lap_sl_1sph_kernel(S["Sigma"][:, :, 0], S["r"], Strg["r"], sh, shtrg, exterior)
+    return _lap_sl_1sph_kernel(qlm_sigma, S["r"], Strg["r"], sh, shtrg, exterior)
 
 @partial(jax.jit, static_argnames=["sh", "shtrg", "exterior"])
-def _lap_dl_1sph_kernel(Sigma: jax.Array, a: float, trg_dr: float,
+def _lap_dl_1sph_kernel(qlm_sigma: jax.Array, a: float, trg_dr: float,
                         sh: shtns_jax.sht, shtrg: shtns_jax.sht, exterior: bool) -> jax.Array:
-    """Jitted core of Lap3d_dl_r_1sph. <exterior> (the trg_dr > a branch) and the
-    nlm pad/truncate are compile-time constants (static args)."""
-    qlm_sigma = sh.analys_cplx_jax(Sigma)
+    """Jitted core of Lap3d_dl_r_1sph. Takes the source density coefficients <qlm_sigma>
+    and returns the DL potential coefficients on the target grid (in the SH basis).
+    <exterior> (the trg_dr > a branch) and the nlm pad/truncate are compile-time
+    constants (static args)."""
     rho = trg_dr / a          # solid harmonics as if src sphere were unit; DL is scale-invariant
     l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
     [diag_ext, diag_int] = Lap3d_dl_diag(sh)
@@ -333,13 +379,14 @@ def _lap_dl_1sph_kernel(Sigma: jax.Array, a: float, trg_dr: float,
     elif nlm_trg < nlm_src:
         qlm_DL_sigma = qlm_DL_sigma[:nlm_trg]
 
-    return shtrg.synth_cplx_jax(qlm_DL_sigma)
+    return qlm_DL_sigma
 
-def Lap3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
+def Lap3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, qlm_sigma: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
     """
     Off-surface evaluation at a spherical grid of targets
-        From source <S> with density <S["Sigma"]>, source uses SHT object <sh>
+        From source <S> with density coefficients <qlm_sigma> (SH basis), source uses <sh>
         To target <Strg>, target uses SHT object <shtrg>
+    Returns the DL potential coefficients on the target grid (SH basis).
     """
 
     if S["lmax"] != sh.lmax:
@@ -350,7 +397,7 @@ def Lap3d_dl_r_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: s
         shtrg = shtns_jax.sht(Strg["lmax"], Strg["lmax"])
 
     exterior = bool(Strg["r"] > S["r"])
-    return _lap_dl_1sph_kernel(S["Sigma"][:, :, 0], S["r"], Strg["r"], sh, shtrg, exterior)
+    return _lap_dl_1sph_kernel(qlm_sigma, S["r"], Strg["r"], sh, shtrg, exterior)
 
 def compute_potential(trg: jax.Array, src: jax.Array, force: jax.Array) -> jax.Array:
     """
@@ -438,33 +485,36 @@ def bio_diag_apply(qlm_sigma: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_s
     return qlm_KL_sigma
 
 @partial(jax.jit, static_argnames=["sh"])
-def bio_onsurf_apply(sigma: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0., radius: float = 1.0) -> jax.Array:
+def bio_onsurf_apply(qlm_sigma: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0., radius: float = 1.0) -> jax.Array:
     """
     Apply the combined DL potential operator K = sl_scal * SL + dl_scal * DL
-        to the density <sigma> defined on the <sh> grid
+        to the density with coefficients <qlm_sigma> in the SH (diagonalizing) basis
         taking into account the DL jump condition with sign <sgn>.
+    Returns the resulting function coefficients in the SH basis, so the on-surface
+    self-apply is a pure diagonal multiply (COB is the caller's responsibility).
     Traction kernel should have opposite sign to DL, but only one should appear per formulation.
     The SL block scales by the source-sphere <radius> (DL/dSL/jump are scale-invariant).
     """
     # assert dl_scal * dsl_scal == 0 # check that only one is nonzero. -- ran into jit compile problem
 
-    qlm_sigma = sh.analys_cplx_jax(sigma)
     qlm_KL_sigma = bio_diag_apply(qlm_sigma, sh, sl_scal, dl_scal, dsl_scal, radius)
-    KL_sigma = sh.synth_cplx_jax(qlm_KL_sigma)
-    return 0.5 * dl_scal * sgn * sigma + 0.5 * dsl_scal * (-1*sgn) * sigma + KL_sigma
+    # The jump condition is a multiple of the identity, hence diagonal in the SH basis too.
+    qlm_jump = 0.5 * dl_scal * sgn * qlm_sigma + 0.5 * dsl_scal * (-1*sgn) * qlm_sigma
+    return qlm_KL_sigma + qlm_jump
 
 @partial(jax.jit, static_argnames=["sh"])
-def bio_onsurf_direct_solve(bc_pot: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0., radius: float = 1.0) -> jax.Array:
+def bio_onsurf_direct_solve(qlm_bc: jax.Array, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, sgn: float, dsl_scal: float = 0., radius: float = 1.0) -> jax.Array:
     """
     Directly solves the BIO equation in the spectral domain.
-    Equation: [0.5 * dl_scal * sgn * I + KL] sigma = bc_pot
+    Equation: [0.5 * dl_scal * sgn * I + KL] sigma = bc, with the right-hand side and the
+    returned density both given by their coefficients in the SH (diagonalizing) basis
+    (<qlm_bc> in, qlm_sigma out); the solve is a diagonal division.
 
     Note: The l=0 mode is in the null space and is set to the BC value.
     The SL block scales by the source-sphere <radius> (DL/dSL/jump are scale-invariant).
     """
     # assert dl_scal * dsl_scal == 0
 
-    qlm_bc = sh.analys_cplx_jax(bc_pot)
     sl_diag = radius * Lap3d_sl_diag(sh)
     [dl_diag_ext, dl_diag_int] = Lap3d_dl_diag(sh)
     dl_diag = 0.5 * (dl_diag_ext + dl_diag_int)
@@ -481,33 +531,33 @@ def bio_onsurf_direct_solve(bc_pot: jax.Array, sh: shtns_jax.sht, sl_scal: float
     safe_diag = jnp.where(near_zero, 1.0, operator_diag)
     qlm_sigma = qlm_bc / safe_diag
     qlm_sigma = jnp.where(near_zero, qlm_bc, qlm_sigma)
-    
-    sigma = sh.synth_cplx_jax(qlm_sigma)
-    
-    return sigma
 
-def bio_offsurf_apply(trg: jax.Array, S: SphereDict, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, far: bool = False) -> jax.Array:
+    return qlm_sigma
+
+def bio_offsurf_apply(trg: jax.Array, qlm_sigma: jax.Array, S: SphereDict, sh: shtns_jax.sht, sl_scal: float, dl_scal: float, far: bool = False) -> jax.Array:
     """
-    Evaluate the KL formulation of <S> with density <S["Sigma"]> at target <trg>
+    Evaluate the KL formulation of <S> with density coefficients <qlm_sigma> (SH basis)
+    at target points <trg>. Returns point values (Ntrg x 1).
     """
     if not far:
-        SLsigma = Lap3d_sl(trg, S, sh)
-        DLsigma = Lap3d_dl(trg, S, sh)
-    else:
-        SLsigma = Lap3d_sl_far(trg, S, sh)
-        DLsigma = Lap3d_dl_far(trg, S, sh)
-    Ksigma = sl_scal * SLsigma + dl_scal * DLsigma 
+        SLsigma = Lap3d_sl(trg, qlm_sigma, S, sh)
+        DLsigma = Lap3d_dl(trg, qlm_sigma, S, sh)
+        return sl_scal * SLsigma + dl_scal * DLsigma
+    # One fused pass over the Ntrg x Nsrc pairs (and one synth) for both operators.
+    return _lap_far(trg, qlm_sigma, S, sh, ("sl", "dl"), sl_scal=sl_scal, dl_scal=dl_scal)
+
+def bio_offsurf_apply_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, qlm_sigma: jax.Array, S: SphereDict, sh: shtns_jax.sht, sl_scal: float, dl_scal: float) -> jax.Array:
+    """
+    Evaluate the KL formulation of <S> with density coefficients <qlm_sigma> (SH basis)
+    at a spherical grid of targets on <Strg>. Returns the potential coefficients on the
+    target grid (SH basis).
+    """
+
+    SLsigma = Lap3d_sl_r_1sph(Strg, shtrg, qlm_sigma, S, sh)
+    DLsigma = Lap3d_dl_r_1sph(Strg, shtrg, qlm_sigma, S, sh)
+    Ksigma = sl_scal * SLsigma + dl_scal * DLsigma
     return Ksigma
 
-def bio_offsurf_apply_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, S: SphereDict, sh: shtns_jax.sht, sl_scal: float, dl_scal: float) -> jax.Array:
-    """
-    Evaluate the KL formulation of <S> with density <S["Sigma"]> at a spherical grid of targets on <Strg>
-    """
-
-    SLsigma = Lap3d_sl_r_1sph(Strg, shtrg, S, sh)
-    DLsigma = Lap3d_dl_r_1sph(Strg, shtrg, S, sh)
-    Ksigma = sl_scal * SLsigma + dl_scal * DLsigma 
-    return Ksigma
 
 if __name__ == "__main__":
     """
@@ -542,29 +592,30 @@ if __name__ == "__main__":
     BC_pot = compute_potential(trg_sphere, ptsrc, force)
     BC_pot = jnp.reshape(BC_pot, x.shape)
 
-    # DIRECT solve
-    sig_direct = bio_onsurf_direct_solve(
-        bc_pot=BC_pot,
+    # DIRECT solve -- densities are handled in the SH (diagonalizing) basis: COB the
+    # boundary data with analys before the solve, invert with synth before the error.
+    qlm_bc = sh.analys_cplx_jax(BC_pot)
+    qlm_sig = bio_onsurf_direct_solve(
+        qlm_bc,
         sh=sh,
         sl_scal=sl_scal,
         dl_scal=dl_scal,
         sgn=sgn
     )
-    bc_check_direct = bio_onsurf_apply(sig_direct, sh, sl_scal, dl_scal, sgn)
-    resid_direct = jnp.linalg.norm(bc_check_direct - BC_pot)
+    qlm_bc_check = bio_onsurf_apply(qlm_sig, sh, sl_scal, dl_scal, sgn)
+    resid_direct = jnp.linalg.norm(qlm_bc_check - qlm_bc)
     jax.debug.print("Residual of DIRECT solve: {a}", a=resid_direct)
 
     # Accuracy
-    xtrg = Strg["Xcart"][:,:,0] 
+    xtrg = Strg["Xcart"][:,:,0]
     ytrg = Strg["Xcart"][:,:,1]
     ztrg = Strg["Xcart"][:,:,2]
     trg_sphere2 = jnp.column_stack([jnp.reshape(xtrg,-1), jnp.reshape(ytrg,-1), jnp.reshape(ztrg,-1)])
     true_pot = compute_potential(trg_sphere2, ptsrc, force)
     true_pot = jnp.real(true_pot)
 
-    S = set_density(S, sig_direct)
-    Ksig_direct = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
-    Ksig_direct = jnp.real(jnp.reshape(Ksig_direct,(-1,1)))
+    qlm_out = bio_offsurf_apply_1sph(Strg, shtrg, qlm_sig, S, sh, sl_scal, dl_scal)
+    Ksig_direct = jnp.real(jnp.reshape(shtrg.synth_cplx_jax(qlm_out), (-1, 1)))
 
     diff_direct = jnp.max(true_pot - Ksig_direct) / jnp.max(true_pot)
     jax.debug.print("Max relative error of order {lmax} solver at target radius {Rtrg} for direct solver is {d}", lmax=lmax, Rtrg=Rtrg, d=diff_direct)
@@ -576,25 +627,25 @@ if __name__ == "__main__":
     yn = S["Xncart"][:,:,1]
     zn = S["Xncart"][:,:,2]
     trgN_sphere = jnp.column_stack([jnp.reshape(xn,-1), jnp.reshape(yn,-1), jnp.reshape(zn,-1)])
-    BC_flux = compute_flux(trg_sphere, trgN_sphere, ptsrc, force) 
+    BC_flux = compute_flux(trg_sphere, trgN_sphere, ptsrc, force)
     BC_flux = jnp.reshape(BC_flux, x.shape)
     # DIRECT solve
-    sig_direct = bio_onsurf_direct_solve(
-        bc_pot=BC_flux,
+    qlm_bc = sh.analys_cplx_jax(BC_flux)
+    qlm_sig = bio_onsurf_direct_solve(
+        qlm_bc,
         sh=sh,
         sl_scal=0.,
         dl_scal=0.,
         sgn=sgn,
         dsl_scal=1.0
     )
-    bc_check_direct = bio_onsurf_apply(sig_direct, sh, 0., 0., sgn, 1.0)
-    resid_direct = jnp.linalg.norm(bc_check_direct - BC_flux)
+    qlm_bc_check = bio_onsurf_apply(qlm_sig, sh, 0., 0., sgn, 1.0)
+    resid_direct = jnp.linalg.norm(qlm_bc_check - qlm_bc)
     jax.debug.print("Residual of DIRECT solve: {a}", a=resid_direct)
 
     # Accuracy
-    S = set_density(S, sig_direct)
-    Ksig_direct = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, 1.0, 0.)
-    Ksig_direct = jnp.real(jnp.reshape(Ksig_direct,(-1,1)))
+    qlm_out = bio_offsurf_apply_1sph(Strg, shtrg, qlm_sig, S, sh, 1.0, 0.)
+    Ksig_direct = jnp.real(jnp.reshape(shtrg.synth_cplx_jax(qlm_out), (-1, 1)))
 
     diff_direct = jnp.max(true_pot - Ksig_direct) / jnp.max(true_pot)
     jax.debug.print("Max relative error of order {lmax} solver at target radius {Rtrg} for direct solver is {d}", lmax=lmax, Rtrg=Rtrg, d=diff_direct)
@@ -619,28 +670,28 @@ if __name__ == "__main__":
     BC_pot = jnp.reshape(BC_pot, x.shape)
 
     # DIRECT solve
-    sig_direct = bio_onsurf_direct_solve(
-        bc_pot=BC_pot,
+    qlm_bc = sh.analys_cplx_jax(BC_pot)
+    qlm_sig = bio_onsurf_direct_solve(
+        qlm_bc,
         sh=sh,
         sl_scal=sl_scal,
         dl_scal=dl_scal,
         sgn=sgn
     )
-    bc_check_direct = bio_onsurf_apply(sig_direct, sh, sl_scal, dl_scal, sgn)
-    resid_direct = jnp.linalg.norm(bc_check_direct - BC_pot)
+    qlm_bc_check = bio_onsurf_apply(qlm_sig, sh, sl_scal, dl_scal, sgn)
+    resid_direct = jnp.linalg.norm(qlm_bc_check - qlm_bc)
     jax.debug.print("Residual of DIRECT solve: {a}", a=resid_direct)
 
     # Accuracy
-    xtrg = Strg["Xcart"][:,:,0] 
+    xtrg = Strg["Xcart"][:,:,0]
     ytrg = Strg["Xcart"][:,:,1]
     ztrg = Strg["Xcart"][:,:,2]
     trg_sphere2 = jnp.column_stack([jnp.reshape(xtrg,-1), jnp.reshape(ytrg,-1), jnp.reshape(ztrg,-1)])
     true_pot = compute_potential(trg_sphere2, ptsrc, force)
     true_pot = jnp.real(true_pot)
 
-    S = set_density(S, sig_direct)
-    Ksig_direct = bio_offsurf_apply_1sph(Strg, shtrg, S, sh, sl_scal, dl_scal)
-    Ksig_direct = jnp.real(jnp.reshape(Ksig_direct,(-1,1)))
+    qlm_out = bio_offsurf_apply_1sph(Strg, shtrg, qlm_sig, S, sh, sl_scal, dl_scal)
+    Ksig_direct = jnp.real(jnp.reshape(shtrg.synth_cplx_jax(qlm_out), (-1, 1)))
 
     diff_direct = jnp.max(true_pot - Ksig_direct) / jnp.max(true_pot)
     jax.debug.print("Max relative error of order {lmax} solver at target radius {Rtrg} for direct solver is {d}", lmax=lmax, Rtrg=Rtrg, d=diff_direct)
