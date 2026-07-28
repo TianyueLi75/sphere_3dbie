@@ -252,12 +252,12 @@ def Lap3d_onsurf_apply(sigma: jax.Array, Sp: SuspensionDict, sh_lst: list,
                 # Evaluate sphere `sind`'s layer potential at sphere `tind`'s surface nodes.
                 s_sph = set_density(s_sph, sigma_s.reshape(s_grid))
                 trg = t_sph["Xcart"].reshape(-1, 3)
-                # if sep_mat[tind, sind] == 0: 
-                #     print("\n in near regime")
-                # else:
-                #     print("\n in far regime")
+                # sep_mat[t, s] == 1 means sphere s is FAR from t (separate_spheres), so that
+                # is the smooth-quadrature branch; near pairs take the spectral point eval.
+                # (This flag used to be passed inverted, sending far pairs through the eager
+                # per-point synthesis and near pairs through the far quadrature.)
                 cross = Lap3d.bio_offsurf_apply(
-                    trg, s_sph, sh_lst[sind], sl_scal_lst[sind], dl_scal_lst[sind], sep_mat[tind, sind] == 0)
+                    trg, s_sph, sh_lst[sind], sl_scal_lst[sind], dl_scal_lst[sind], sep_mat[tind, sind] == 1)
 
                 acc = acc + cross.reshape(-1)   
 
@@ -367,7 +367,7 @@ def build_ps_evaluators(Sp: SuspensionDict, Ns: int, sh_lst, sep_mat: jax.Array)
 
 
 def build_far_evaluators(Sp: SuspensionDict, Ns: int, sh_lst, sep_mat: jax.Array,
-                         far_chunk: int = 2048) -> dict:
+                         far_chunk: int = None) -> dict:
     """Eagerly build one jitted direct far evaluator per SOURCE sphere that has >= 1 far target
     (sep_mat[tind, sind] == 1). Each source's far targets (the surface nodes of every far target
     sphere) are concatenated into a single static Xtrg list, and the evaluator maps the source
@@ -377,18 +377,19 @@ def build_far_evaluators(Sp: SuspensionDict, Ns: int, sh_lst, sep_mat: jax.Array
     split because this runs inside a jitted matvec and the spectral near-eval is eager-only;
     the sphere-level sep_mat already guarantees every node of a far source's target is far.
 
-    To keep the (Ntrg_s x Nsrc x 3) broadcast inside bio_offsurf_apply from being materialized in
-    full (a memory wall at scale), the Ntrg_s targets are processed in vectorized CHUNKS of
-    <far_chunk>: batched WITHIN a chunk by the existing broadcast, scanned ACROSS chunks by
-    jax.lax.map, so peak memory is O(far_chunk x Nsrc). Sources with Ntrg_s <= far_chunk take a
-    fast single-broadcast path (no scan overhead).
+    Peak memory is bounded by the far kernel itself, which tiles its target loop (see
+    sphere.far_tile_map): the tile is sized from Nsrc by sphere.far_tile_size, or forced with
+    <far_chunk> if that is given. Tiling inside the kernel (rather than around it, as this
+    function used to do) means the density is synthesized to the source grid ONCE per matvec
+    instead of once per operator per chunk.
 
     Returns {sind: (far_eval, dest)} where:
-      - far_eval(sigma_s, sl, dl) -> (Ntrg_s, 3), sigma_s is the source density (nphi_s,ntheta_s,3)
+      - far_eval(vwx_s, sl, dl) -> (Ntrg_s, 3), vwx_s is the source density VWX coefficients
+        (3, nlm_s); the far kernel synthesizes them back to the source grid internally.
       - dest is a static int index array of shape (3*Ntrg_s,): the flat rows in the suspension
         output vector that far_eval's flattened (Ntrg_s, 3) output writes to, in Xtrg order. This
         encodes the entire scatter (one .at[dest].add), so no per-chunk loop is needed.
-    Only sigma_s/sl/dl are dynamic; Xtrg and source geometry (Xcart, Xncart, r, lmax) and sh are
+    Only vwx_s/sl/dl are dynamic; Xtrg and source geometry (Xcart, Xncart, r, lmax) and sh are
     closed over concretely, so this traces cleanly inside the lineax matvec."""
     spheres = Sp["spheres_lst"]
     bounds = _block_bounds3(Sp, Ns)
@@ -405,39 +406,22 @@ def build_far_evaluators(Sp: SuspensionDict, Ns: int, sh_lst, sep_mat: jax.Array
 
         s_sph = spheres[sind]
         sh_s = sh_lst[sind]
-        nphi_s, ntheta_s = s_sph["Xcart"].shape[:2]
 
-        # Pre-chunk targets: pad up to a multiple of far_chunk (repeat last row -> finite dummy
-        # targets, discarded after) and reshape to (n_chunks, far_chunk, 3).
-        use_chunks = Ntrg_s > far_chunk
-        if use_chunks:
-            n_chunks = -(-Ntrg_s // far_chunk)               # ceil div
-            pad = n_chunks * far_chunk - Ntrg_s
-            Xtrg_pad = jnp.concatenate([Xtrg_s, jnp.broadcast_to(Xtrg_s[-1], (pad, 3))]) if pad else Xtrg_s
-            Xtrg_chunks = Xtrg_pad.reshape(n_chunks, far_chunk, 3)
-
-        def _make_far_eval(s_sph, sh_s, Xtrg_s, Xtrg_chunks, Ntrg_s, nphi_s, ntheta_s, use_chunks):
+        def _make_far_eval(s_sph, sh_s, Xtrg_s):
             @jax.jit
-            def far_eval(sigma_s, sl, dl):
-                # inject the traced density (pure-jax dict copy; geometry stays concrete)
-                S = {**s_sph, "Sigma": sigma_s.reshape(nphi_s, ntheta_s, 3)}
+            def far_eval(vwx_s, sl, dl):
                 # far=True forces the pure-JAX smooth quadrature for every target: this runs
                 # inside a jitted matvec, and bio_offsurf_apply's per-target far/near split
                 # (far=None) would evaluate the spectral near-eval, which is eager-only (C
                 # per-point synthesis, not traceable). The sphere-level sep_mat already
                 # guarantees every node of a far target sphere is far, so no split is needed.
-                if not use_chunks:
-                    return Stk3d.bio_offsurf_apply(Xtrg_s, S, sh_s, sl, dl, far=True)  # (Ntrg_s, 3)
-                # batched WITHIN a chunk (broadcast), scanned ACROSS chunks (bounded memory)
-                def chunk_fn(trg_chunk):                     # (far_chunk, 3) -> (far_chunk, 3)
-                    return Stk3d.bio_offsurf_apply(trg_chunk, S, sh_s, sl, dl, far=True)
-                out = jax.lax.map(chunk_fn, Xtrg_chunks)     # (n_chunks, far_chunk, 3)
-                return out.reshape(-1, 3)[:Ntrg_s]           # drop padding
+                # The density is passed as VWX coefficients (vwx_s); bio_offsurf_apply's far
+                # kernel synthesizes them back to the source grid to run the direct quadrature.
+                return Stk3d._stk_far(Xtrg_s, vwx_s, s_sph, sh_s, ("sl", "dl"),
+                                      sl_scal=sl, dl_scal=dl, tile=far_chunk)  # (Ntrg_s, 3)
             return far_eval
 
-        evals[sind] = (_make_far_eval(s_sph, sh_s, Xtrg_s,
-                                      Xtrg_chunks if use_chunks else None,
-                                      Ntrg_s, nphi_s, ntheta_s, use_chunks), dest)
+        evals[sind] = (_make_far_eval(s_sph, sh_s, Xtrg_s), dest)
     return evals
 
 
@@ -612,7 +596,7 @@ def Stk3d_onsurf_apply_np(sigma, Sp: SuspensionDict, Ns: int, sh_lst: list,
 def Stk3d_onsurf_solve(bc_vec: jax.Array, Sp: SuspensionDict, Ns, Nnodes: int, sh_lst: list,
                        sl_scal_lst, dl_scal_lst, sgn_lst,
                        tol: float = 1e-11, atol: float = 1e-11, maxiter: int = 200,
-                       precond: bool = True, far_chunk: int = 2048):
+                       precond: bool = True, far_chunk: int = None):
     """
     Solve K[sigma] = bc_vec for the suspension Stokes surface density sigma (vector).
 
@@ -713,7 +697,7 @@ def Stk3d_onsurf_solve(bc_vec: jax.Array, Sp: SuspensionDict, Ns, Nnodes: int, s
 def Stk3d_onsurf_solve_spla(bc_vec: jax.Array, Sp: SuspensionDict, Ns, Nnodes: int, sh_lst: list,
                        sl_scal_lst, dl_scal_lst, sgn_lst,
                        tol: float = 1e-10, atol: float = 1e-14, maxiter: int = 200,
-                       precond: bool = True, far_chunk: int = 2048, numpy: bool = False):
+                       precond: bool = True, far_chunk: int = None, numpy: bool = False):
     """
     Solve K[sigma] = bc_vec for the suspension Stokes surface density sigma (vector).
 
@@ -738,7 +722,7 @@ def Stk3d_onsurf_solve_spla(bc_vec: jax.Array, Sp: SuspensionDict, Ns, Nnodes: i
 
     if numpy:
         ps_evals = build_ps_evaluators_np(Sp, Ns, sh_lst, sep_mat)
-        far_evals = build_far_evaluators_np(Sp, Ns, sh_lst, sep_mat, far_chunk=far_chunk)
+        far_evals = build_far_evaluators_np(Sp, Ns, sh_lst, sep_mat, far_chunk=far_chunk or 2048)
     else:
         ps_evals = build_ps_evaluators(Sp, Ns, sh_lst, sep_mat)
         far_evals = build_far_evaluators(Sp, Ns, sh_lst, sep_mat, far_chunk=far_chunk)
