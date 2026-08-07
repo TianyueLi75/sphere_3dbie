@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from suspension import build_suspension, quadr_suspension, Stk3d_onsurf_solve_spla
 from sphere import set_density
 from biop import Stk3d
+import vtk_export
 
 jax.config.update("jax_enable_x64", True)
 
@@ -89,9 +90,54 @@ def build_bc(Sp, dsp, mode):
     return bc
 
 
-def test(lmax: int, chk: jax.Array, mode: str):
+def eval_field(targets, sigma, Sp, sh_lst, dsp, sl_lst, dl_lst):
+    """Evaluate the off-surface Stokes velocity (real, (Ntrg,3)) at <targets> by summing
+    every sphere's single/double-layer contribution from the solved density <sigma>."""
+    Ns = Sp["Ns"]
+    approx = jnp.zeros((targets.shape[0], 3), dtype=jnp.complex128)
+    for s in range(Ns):
+        s_sph = Sp["spheres_lst"][s]
+        nphi, ntheta = s_sph["Xcart"].shape[:2]
+        sig_s = sigma[3 * int(dsp[s]): 3 * int(dsp[s + 1])].reshape(nphi, ntheta, 3)
+        vwx_s = jnp.stack(Stk3d.sig_xyz2vwx(sig_s[:, :, 0], sig_s[:, :, 1], sig_s[:, :, 2],
+                                            s_sph["Xsph"][:, :, 0], s_sph["Xsph"][:, :, 1], sh_lst[s]))
+        approx = approx + Stk3d.bio_offsurf_apply(targets, vwx_s, s_sph, sh_lst[s], sl_lst[s], dl_lst[s])
+    return np.real(np.asarray(approx))
+
+
+def write_vtk_solution(sigma, Sp, sh_lst, dsp, sl_lst, dl_lst, bc, mode, out_dir, Ng=48):
+    """Write the solved velocity field on a uniform grid (interior to the container,
+    exterior to every obstacle) plus the sphere geometry to <out_dir>, as both a legacy
+    STRUCTURED_POINTS .vtk and a partitioned .pvtu (+ .vtu pieces). Points outside the
+    fluid domain are masked to zero velocity."""
+    os.makedirs(out_dir, exist_ok=True)
+    trg_data = vtk_export.grid_from_spheres(Sp, Ng, pad=0.001)
+    trg_grid = trg_data["points"]
+    Cnp = np.asarray(CENTERS)
+    Rnp = np.asarray(RADII)
+    inside = np.linalg.norm(trg_grid - Cnp[0], axis=1) < Rnp[0] * 0.999   # interior to container
+    for s in range(1, NS):
+        inside &= np.linalg.norm(trg_grid - Cnp[s], axis=1) > Rnp[s] * 1.001   # outside obstacle s
+
+    Ufield = np.zeros((trg_grid.shape[0], 3), dtype=float)
+    if np.any(inside):
+        Ufield[inside] = eval_field(jnp.asarray(trg_grid[inside]), sigma, Sp, sh_lst,
+                                    dsp, sl_lst, dl_lst)
+
+    field_vtk = os.path.join(out_dir, f"Stk3d_container_4sph_{mode}_field.vtk")
+    field_pvtu = os.path.join(out_dir, f"Stk3d_container_4sph_{mode}_field.pvtu")
+    geom_vtk = os.path.join(out_dir, f"Stk3d_container_4sph_{mode}_geometry.vtk")
+    vtk_export.export_field(trg_data, Ufield, field_vtk, name="velocity")
+    vtk_export.export_field_pvtu(trg_data, Ufield, field_pvtu, name="velocity")
+    vtk_export.export_objects(geom_vtk, Sp, np.real(np.asarray(bc)).reshape(-1, 3))
+    print(f"  wrote VTK field ({os.path.basename(field_vtk)}, "
+          f"{os.path.basename(field_pvtu)}) + geometry to {out_dir}", flush=True)
+
+
+def test(lmax: int, chk: jax.Array, mode: str, vtk_dir: str | None = None):
     """One run at resolution <lmax> (uniform on all spheres); returns timings + the
-    velocity at fixed points <chk>."""
+    velocity at fixed points <chk>. When <vtk_dir> is given, also writes the solution
+    field + geometry there (used only for the highest lmax)."""
     Sp = build_suspension(CENTERS, RADII, SEP_ETA)
     # lmax_lst = jnp.full((NS,), lmax)
     lmax_lst = 36 * jnp.ones((NS,))
@@ -113,16 +159,11 @@ def test(lmax: int, chk: jax.Array, mode: str):
 
     # Time the off-surface field evaluation at the fixed check points.
     t0 = time.time()
-    approx = jnp.zeros((chk.shape[0], 3), dtype=jnp.complex128)
-    for s in range(Ns):
-        s_sph = Sp["spheres_lst"][s]
-        nphi, ntheta = s_sph["Xcart"].shape[:2]
-        sig_s = sigma[3 * int(dsp[s]): 3 * int(dsp[s + 1])].reshape(nphi, ntheta, 3)
-        vwx_s = jnp.stack(Stk3d.sig_xyz2vwx(sig_s[:, :, 0], sig_s[:, :, 1], sig_s[:, :, 2],
-                                            s_sph["Xsph"][:, :, 0], s_sph["Xsph"][:, :, 1], sh_lst[s]))
-        approx = approx + Stk3d.bio_offsurf_apply(chk, vwx_s, s_sph, sh_lst[s], sl_lst[s], dl_lst[s])
-    u_chk = np.real(np.asarray(approx))
+    u_chk = eval_field(chk, sigma, Sp, sh_lst, dsp, sl_lst, dl_lst)
     t_eval = time.time() - t0
+
+    if vtk_dir is not None:
+        write_vtk_solution(sigma, Sp, sh_lst, dsp, sl_lst, dl_lst, bc, mode, vtk_dir)
 
     return t_solve, t_eval, float(resid), int(info), int(iters), u_chk
 
@@ -137,8 +178,8 @@ def plot_timing_convergence(lmax_list, t_solve, t_eval, err, title, path):
     l1 = ax1.loglog(lmax_list, t_solve, 'k+-', label="coupled solve / iter")
     l2 = ax1.loglog(lmax_list, t_eval, 'ko-', label="off-surf eval")
     # O(lmax^3) reference anchored at the finest per-iteration timing.
-    ref = t_solve[-1] * (lmax_arr / lmax_arr[-1]) ** 3
-    l4 = ax1.loglog(lmax_arr, ref, 'b:', label=r"$\propto$ lmax$^3$")
+    # ref = t_solve[-1] * (lmax_arr / lmax_arr[-1]) ** 3
+    # l4 = ax1.loglog(lmax_arr, ref, 'b:', label=r"$\propto$ lmax$^3$")
     ax1.set_xlabel("lmax"); ax1.set_ylabel("Time (s)")
 
     ax2 = ax1.twinx()
@@ -146,7 +187,7 @@ def plot_timing_convergence(lmax_list, t_solve, t_eval, err, title, path):
                     label=f"max rel diff vs lmax={lmax_list[-1]}")
     ax2.set_ylabel(f"max rel diff vs lmax={lmax_list[-1]}")
 
-    lines = l1 + l2 + l4 + l3
+    lines = l1 + l2 + l3
     ax1.legend(lines, [ln.get_label() for ln in lines])
     ax1.set_title(title)
     fig.tight_layout()
@@ -200,9 +241,12 @@ def run(mode, chk, lmax_list):
     iters_list = np.zeros(len(lmax_list), dtype=int)
     u_all = []
     print(f"{'lmax':>5} {'info':>5} {'iters':>6} {'residual':>12} {'t_solve(s)':>12} {'t/iter(s)':>12} {'t_eval(s)':>12}", flush=True)
+    plots_dir = os.path.join(here, "plots")
     for i, lmax in enumerate(lmax_list):
         print(f"  ... starting lmax={lmax}", flush=True)
-        ts, te, resid, info, iters, u_chk = test(int(lmax), chk, mode)
+        # Only the finest lmax dumps the volumetric field for visualization.
+        vtk_dir = plots_dir if i == len(lmax_list) - 1 else None
+        ts, te, resid, info, iters, u_chk = test(int(lmax), chk, mode, vtk_dir=vtk_dir)
         t_solve[i], t_eval[i], iters_list[i] = ts, te, iters
         t_periter_solve[i] = ts / iters
         u_all.append(u_chk)
@@ -216,13 +260,13 @@ def run(mode, chk, lmax_list):
     for i in range(len(lmax_list) - 1):
         print(f"  lmax={lmax_list[i]:>3d}: max rel diff = {err[i]:.3e}")
 
-    growth_exponent(lmax_list, t_periter_solve)
+    # growth_exponent(lmax_list, t_periter_solve)
 
-    path = os.path.join(here, f"./plots/Stk3d_container_4sph_{mode}.svg")
-    plot_timing_convergence(lmax_list, t_periter_solve, t_eval, err,
-                            f"4-sphere container Stokes ({mode} slip): timing + self-convergence",
-                            path)
-    print(f"Wrote Stk3d_container_4sph_{mode}.svg to", here)
+    # path = os.path.join(here, f"./plots/Stk3d_container_4sph_{mode}.svg")
+    # plot_timing_convergence(lmax_list, t_periter_solve, t_eval, err,
+    #                         f"4-sphere container Stokes ({mode} slip): timing + self-convergence",
+    #                         path)
+    # print(f"Wrote Stk3d_container_4sph_{mode}.svg to", here)
 
 
 if __name__ == "__main__":

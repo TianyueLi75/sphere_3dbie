@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-import lineax as lx
+# import lineax as lx
 import os
 import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -121,8 +121,13 @@ def plot_timing_convergence(lmax_list, t_solve, t_eval, err, title, path):
 
 if __name__ == "__main__":
     here = os.path.dirname(os.path.abspath(__file__))
-    lmax_list = [2**n for n in range(2,13)]
+    lmax_list = [2**n for n in range(2,11)]
     Np = len(lmax_list)
+    plotname_prefix = os.path.join(here, './plots/Stk3d_1sph_')
+    if shtns_jax.CUDA_AVAILABLE:
+        plotname_prefix += 'gpu_'
+    else:
+        plotname_prefix += 'cpu_'
 
     # Exterior problem
     Tsolve_diag = np.zeros((Np,))
@@ -138,8 +143,8 @@ if __name__ == "__main__":
 
     plot_timing_convergence(lmax_list, Tsolve_diag, Teval, Edirect,
                             "Stk3d manufactured solution, exterior",
-                            os.path.join(here, './plots/Stk3d_exterior1sph.svg'))
-    print("Wrote Stk3d_exterior1sph.svg to", here)
+                            plotname_prefix+'exterior.svg')
+    print("Wrote"+ plotname_prefix +"exterior.svg to ", here)
 
 
     # Interior problem
@@ -156,5 +161,5 @@ if __name__ == "__main__":
 
     plot_timing_convergence(lmax_list, Tsolve_diag, Teval, Edirect,
                             "Stk3d manufactured solution, interior",
-                            os.path.join(here, './plots/Stk3d_interior1sph.svg'))
-    print("Wrote Stk3d_interior1sph.svg to", here)
+                            plotname_prefix+'exterior.svg')
+    print("Wrote"+ plotname_prefix +"interior.svg to ", here)

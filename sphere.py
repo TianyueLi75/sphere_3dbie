@@ -40,7 +40,7 @@ def quadr_sphere(S: SphereDict, lmax: int) -> Tuple[SphereDict, shtns_jax.sht]:
     S["lmax"] = lmax
     
     sh = shtns_jax.sht(int(lmax))
-    ntheta, nphi = sh.set_grid(flags=shtns.SHT_THETA_CONTIGUOUS) # TODO: allow GPU
+    ntheta, nphi = sh.set_grid(flags=shtns.SHT_ALLOW_GPU + shtns.SHT_THETA_CONTIGUOUS) 
     thetas = jnp.arccos(sh.cos_theta)
     phis = jnp.linspace(0, 2 * jnp.pi, nphi, endpoint=False)
     phi_grid, theta_grid = jnp.meshgrid(phis, thetas, indexing="ij")

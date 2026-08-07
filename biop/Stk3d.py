@@ -18,7 +18,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 # import scipy.sparse.linalg
-import lineax as lx
+# import lineax as lx
 import shtns
 import shtns_jax
 

@@ -65,6 +65,52 @@ def export_field(grid, field, path, name=None):
                                    point_vectors=pv, point_scalars=ps, title=os.path.basename(path))
 
 
+def export_field_pvtu(grid, field, path, name=None, npieces=4):
+    """Write a field sampled on grid["points"] to a partitioned XML UnstructuredGrid:
+    a master <path> (.pvtu) plus <npieces> hexahedral .vtu pieces sliced along z. The
+    grid is meshed into VTK hexahedra so ParaView's Stream Tracer / Slice / Glyph work
+    on the partitioned dataset too. field is (N,) scalar or (N,3) vector, in the same
+    x-fastest order as grid["points"]; masking must already be baked in by the caller."""
+    field = np.asarray(field)
+    nx, ny, nz = (int(d) for d in grid["dims"])
+    N = nx * ny * nz
+    assert field.shape[0] == N, f"field has {field.shape[0]} rows, grid has {N} points"
+    if not path.endswith(".pvtu"):
+        raise ValueError("pvtu path must end in .pvtu")
+    pts = np.asarray(grid["points"], dtype=float)
+
+    if field.ndim == 2 and field.shape[1] == 3:
+        vec = np.real(field)
+        pv_all = {name or "velocity": vec}
+        ps_all = {"speed": np.linalg.norm(vec, axis=1)}
+    else:
+        pv_all = None
+        ps_all = {name or "potential": np.real(field).reshape(-1)}
+
+    stem = path[:-len(".pvtu")]
+    base = os.path.basename(stem)
+    # Slab the grid along z into <npieces> contiguous chunks; adjacent pieces share the
+    # boundary z-layer so hexahedra tile the full volume without gaps.
+    npieces = max(1, min(int(npieces), nz - 1))
+    edges = np.linspace(0, nz, npieces + 1).round().astype(int)
+    sources = []
+    for p in range(npieces):
+        k0, k1 = edges[p], edges[p + 1]        # z-layers [k0, k1); include k1 for shared face
+        khi = min(k1 + 1, nz) if k1 < nz else nz
+        klayers = np.arange(k0, khi)
+        sel = (np.arange(N).reshape(nz, ny, nx)[klayers].reshape(-1))
+        pts_p = pts[sel]
+        pnz = klayers.shape[0]
+        hexes = vtk_io.grid_hexes(nx, ny, pnz)
+        pv_p = {k: v[sel] for k, v in pv_all.items()} if pv_all else None
+        ps_p = {k: v[sel] for k, v in ps_all.items()} if ps_all else None
+        piece_path = f"{stem}_{p}.vtu"
+        vtk_io.write_vtu(piece_path, pts_p, hexes,
+                         point_vectors=pv_p, point_scalars=ps_p)
+        sources.append(f"{base}_{p}.vtu")
+    vtk_io.write_pvtu(path, sources, point_vectors=pv_all, point_scalars=ps_all)
+
+
 def export_objects(path, Sp, bc_vec=None):
     """Write all sphere surfaces to a single POLYDATA .vtk file, with a 'sphere_id' scalar
     and (optional) the per-node boundary velocity 'bc' as point vectors. bc_vec is the flat
