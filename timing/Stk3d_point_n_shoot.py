@@ -47,7 +47,7 @@ def test(lmax, src_c=(0., 0., 0.), src_r=1.0, trg_c=(3.0, 0., 0.), trg_r=0.5, se
     # Random (real) vector surface density on the source.
     rng = np.random.default_rng(seed)
     nphi, ntheta = S["Xcart"].shape[:2]
-    sig = rng.standard_normal((nphi, ntheta, 3)) + 0j
+    sig = rng.standard_normal((nphi, ntheta, 3))   # real density (real/truncated sig_xyz2vwx takes float64)
     # density -> VWX coefficients (the coeff-basis evaluator input)
     vwx = jnp.stack(Stk3d.sig_xyz2vwx(jnp.asarray(sig[:, :, 0]), jnp.asarray(sig[:, :, 1]),
                                       jnp.asarray(sig[:, :, 2]), S["Xsph"][:, :, 0], S["Xsph"][:, :, 1], sh))

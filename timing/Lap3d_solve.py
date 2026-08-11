@@ -47,7 +47,7 @@ def test(lmax: int):
     qlm_bc = sh.analys_cplx_jax(BC_pot)
     struct = jax.eval_shape(lambda: jnp.zeros((sh.nlm_cplx,), dtype=jnp.complex128))
     LapK_apply = partial(
-        bio_onsurf_apply,
+        bio_onsurf_apply_cplx,   # concentric 1sph accuracy eval below is cplx-only; keep whole test cplx
         sh=sh,
         sl_scal=sl_scal,
         dl_scal=dl_scal,
@@ -67,20 +67,20 @@ def test(lmax: int):
 
     sig_gmres = solution.value                   # SH coefficients
     stats = solution.stats
-    bc_check = bio_onsurf_apply(sig_gmres, sh, sl_scal, dl_scal, sgn)
+    bc_check = bio_onsurf_apply_cplx(sig_gmres, sh, sl_scal, dl_scal, sgn)
     resid_gmres = jnp.linalg.norm(bc_check - qlm_bc)
     jax.debug.print("Residual of GMRES solve = {a}, number of iterations = {b}", a=resid_gmres, b=stats["num_steps"])
 
     # DIRECT solve (coeff -> coeff)
-    sig_direct = bio_onsurf_direct_solve(qlm_bc, sh=sh, sl_scal=sl_scal, dl_scal=dl_scal, sgn=sgn)
+    sig_direct = bio_onsurf_direct_solve_cplx(qlm_bc, sh=sh, sl_scal=sl_scal, dl_scal=dl_scal, sgn=sgn)
     jax.block_until_ready(sig_direct)   # warmup: finish compile before timing
     tstart = time.time()
-    sig_direct = bio_onsurf_direct_solve(qlm_bc, sh=sh, sl_scal=sl_scal, dl_scal=dl_scal, sgn=sgn)
+    sig_direct = bio_onsurf_direct_solve_cplx(qlm_bc, sh=sh, sl_scal=sl_scal, dl_scal=dl_scal, sgn=sgn)
     jax.block_until_ready(sig_direct)
     tend = time.time()
     time_direct = tend - tstart
 
-    bc_check_direct = bio_onsurf_apply(sig_direct, sh, sl_scal, dl_scal, sgn)
+    bc_check_direct = bio_onsurf_apply_cplx(sig_direct, sh, sl_scal, dl_scal, sgn)
     resid_direct = jnp.linalg.norm(bc_check_direct - qlm_bc)
     jax.debug.print("Residual of DIRECT solve: {a}", a=resid_direct)
 

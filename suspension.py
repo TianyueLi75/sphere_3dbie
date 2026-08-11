@@ -45,7 +45,6 @@ sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), "vis
 from sphere import *
 from biop import Lap3d
 from biop import Stk3d
-from biop import Stk3d_np
 import vtk_export
 
 import scipy.sparse.linalg as spla
@@ -215,18 +214,22 @@ def _block_slice(Sp: SuspensionDict, sind: int) -> slice:
 # coeff -> grid after) and inside the coeff-space matvec, which wraps the existing grid operator.
 
 def _coeff_len_lap(Ns: int, sh_lst) -> int:
-    return int(sum(sh_lst[s].nlm_cplx for s in range(Ns)))
+    # return int(sum(sh_lst[s].nlm_cplx for s in range(Ns)))   # complex/full SH layout
+    return int(sum(sh_lst[s].nlm for s in range(Ns)))          # real/truncated SH layout
 
 def _coeff_len_stk(Ns: int, sh_lst) -> int:
-    return int(sum(3 * sh_lst[s].nlm_cplx for s in range(Ns)))
+    # return int(sum(3 * sh_lst[s].nlm_cplx for s in range(Ns)))   # complex/full VSHT layout
+    return int(sum(3 * sh_lst[s].nlm for s in range(Ns)))          # real/truncated VSHT layout
 
 def grid2coeff_lap(vg: jax.Array, Sp: SuspensionDict, Ns: int, sh_lst) -> jax.Array:
     """Flat scalar grid vector -> concatenated per-sphere SH coefficients (analys per block)."""
-    vg = jnp.asarray(vg, dtype=jnp.complex128).reshape(-1)
+    # vg = jnp.asarray(vg, dtype=jnp.complex128).reshape(-1)   # complex grid for the cplx analysis
+    vg = jnp.real(jnp.asarray(vg)).reshape(-1)                 # real/truncated analys_jax takes float64
     out = []
     for s in range(Ns):
         grid = Sp["spheres_lst"][s]["Xcart"].shape[:2]
-        out.append(sh_lst[s].analys_cplx_jax(vg[_block_slice(Sp, s)].reshape(grid)))
+        # out.append(sh_lst[s].analys_cplx_jax(vg[_block_slice(Sp, s)].reshape(grid)))   # cplx
+        out.append(sh_lst[s].analys_jax(vg[_block_slice(Sp, s)].reshape(grid)))          # real
     return jnp.concatenate(out)
 
 def coeff2grid_lap(vc: jax.Array, Sp: SuspensionDict, Ns: int, sh_lst) -> jax.Array:
@@ -234,13 +237,15 @@ def coeff2grid_lap(vc: jax.Array, Sp: SuspensionDict, Ns: int, sh_lst) -> jax.Ar
     vc = jnp.asarray(vc, dtype=jnp.complex128).reshape(-1)
     out, c0 = [], 0
     for s in range(Ns):
-        n = sh_lst[s].nlm_cplx
-        out.append(sh_lst[s].synth_cplx_jax(vc[c0:c0 + n]).reshape(-1)); c0 += n
+        # n = sh_lst[s].nlm_cplx; out.append(sh_lst[s].synth_cplx_jax(vc[c0:c0 + n]).reshape(-1))   # cplx
+        n = sh_lst[s].nlm                                                                            # real
+        out.append(sh_lst[s].synth_jax(vc[c0:c0 + n]).reshape(-1)); c0 += n
     return jnp.concatenate(out)
 
 def grid2coeff_stk(vg: jax.Array, Sp: SuspensionDict, Ns: int, sh_lst, bounds: list) -> jax.Array:
     """Flat Cartesian grid vector -> concatenated per-sphere stacked-VWX coefficients (sig_xyz2vwx)."""
-    vg = jnp.asarray(vg, dtype=jnp.complex128).reshape(-1)
+    # vg = jnp.asarray(vg, dtype=jnp.complex128).reshape(-1)   # complex grid for the cplx analysis
+    vg = jnp.real(jnp.asarray(vg)).reshape(-1)                 # real/truncated analysis takes float64 grid
     out = []
     for s in range(Ns):
         sph = Sp["spheres_lst"][s]; nphi, ntheta = sph["Xcart"].shape[:2]; gst, gsp = bounds[s]
@@ -256,7 +261,8 @@ def coeff2grid_stk(vc: jax.Array, Sp: SuspensionDict, Ns: int, sh_lst) -> jax.Ar
     for s in range(Ns):
         sph = Sp["spheres_lst"][s]; nphi, ntheta = sph["Xcart"].shape[:2]
         th, ph = sph["Xsph"][:, :, 0], sph["Xsph"][:, :, 1]
-        nlm = sh_lst[s].nlm_cplx; vwx = vc[c0:c0 + 3 * nlm].reshape(3, nlm); c0 += 3 * nlm
+        # nlm = sh_lst[s].nlm_cplx; vwx = vc[c0:c0 + 3 * nlm].reshape(3, nlm); c0 += 3 * nlm   # cplx layout
+        nlm = sh_lst[s].nlm; vwx = vc[c0:c0 + 3 * nlm].reshape(3, nlm); c0 += 3 * nlm          # real/truncated layout
         vx, vy, vz = Stk3d.sig_vwx2xyz(vwx[0], vwx[1], vwx[2], th, ph, sh_lst[s])
         out.append(jnp.stack([vx, vy, vz], axis=2).reshape(-1))
     return jnp.concatenate(out)
@@ -291,7 +297,8 @@ def Lap3d_onsurf_apply(sig_coeff: jax.Array, Sp: SuspensionDict, sh_lst: list,
     # unpack per-sphere SH coefficient blocks
     cb, c0 = [], 0
     for s in range(Ns):
-        n = sh_lst[s].nlm_cplx; cb.append((c0, c0 + n)); c0 += n
+        # n = sh_lst[s].nlm_cplx; cb.append((c0, c0 + n)); c0 += n   # cplx layout
+        n = sh_lst[s].nlm; cb.append((c0, c0 + n)); c0 += n          # real/truncated layout
     qlm_blocks = [sig_coeff[cb[s][0]:cb[s][1]] for s in range(Ns)]
 
     out = []
@@ -304,7 +311,8 @@ def Lap3d_onsurf_apply(sig_coeff: jax.Array, Sp: SuspensionDict, sh_lst: list,
         # then analyse once back to t's SH coefficients.
         if Ns > 1:
             trg = t_sph["Xcart"].reshape(-1, 3)
-            cross = jnp.zeros((trg.shape[0], 1), dtype=jnp.complex128)
+            # cross = jnp.zeros((trg.shape[0], 1), dtype=jnp.complex128)   # cplx bio_offsurf
+            cross = jnp.zeros((trg.shape[0], 1), dtype=jnp.float64)        # real bio_offsurf -> float64
             for sind in range(Ns):
                 if sind == tind:
                     continue
@@ -315,7 +323,8 @@ def Lap3d_onsurf_apply(sig_coeff: jax.Array, Sp: SuspensionDict, sh_lst: list,
                 cross = cross + Lap3d.bio_offsurf_apply(
                     trg, qlm_blocks[sind], spheres[sind], sh_lst[sind],
                     sl_scal_lst[sind], dl_scal_lst[sind], sep_mat[tind, sind] == 1)
-            acc = acc + sh_lst[tind].analys_cplx_jax(cross.reshape(t_sph["Xcart"].shape[:2]))
+            # acc = acc + sh_lst[tind].analys_cplx_jax(cross.reshape(t_sph["Xcart"].shape[:2]))   # cplx
+            acc = acc + sh_lst[tind].analys_jax(cross.reshape(t_sph["Xcart"].shape[:2]))          # real
         out.append(acc)
 
     return jnp.concatenate(out)
@@ -365,7 +374,7 @@ def Lap3d_onsurf_solve(bc_pot: jax.Array, Sp: SuspensionDict, sh_lst: list,
             rc = jnp.asarray(rc, dtype=jnp.complex128).reshape(-1)
             z, c0 = [], 0
             for sind in range(Ns):
-                n = sh_lst[sind].nlm_cplx
+                n = sh_lst[sind].nlm   # real/truncated layout (was nlm_cplx)
                 z.append(Lap3d.bio_onsurf_direct_solve(
                     rc[c0:c0 + n], sh_lst[sind],
                     sl_scal_lst[sind], dl_scal_lst[sind], sgn_lst[sind])); c0 += n
@@ -383,11 +392,6 @@ def Lap3d_onsurf_solve(bc_pot: jax.Array, Sp: SuspensionDict, sh_lst: list,
     return sigma, info, resid
 
 
-def _block_slice3(Sp: SuspensionDict, sind: int) -> slice:
-    """Row range owned by sphere `sind` in a flat Stokes suspension density/BC vector
-    (3 velocity components per node, so 3x the scalar offsets)."""
-    dsp = Sp["Nnodes_dsp"]
-    return slice(3 * int(dsp[sind]), 3 * int(dsp[sind + 1]))
 
 
 def _block_bounds3(Sp: SuspensionDict, Ns: int) -> list:
@@ -512,8 +516,10 @@ def Stk3d_onsurf_apply(sig_coeff: jax.Array, Sp: SuspensionDict, Ns: int, sh_lst
     # unpack per-sphere stacked-VWX coefficient blocks
     cb, c0 = [], 0
     for s in range(Ns):
-        n = 3 * sh_lst[s].nlm_cplx; cb.append((c0, c0 + n)); c0 += n
-    vwx_blocks = [sig_coeff[cb[s][0]:cb[s][1]].reshape(3, sh_lst[s].nlm_cplx) for s in range(Ns)]
+        # n = 3 * sh_lst[s].nlm_cplx; cb.append((c0, c0 + n)); c0 += n           # cplx layout
+        n = 3 * sh_lst[s].nlm; cb.append((c0, c0 + n)); c0 += n                  # real/truncated layout
+    # vwx_blocks = [sig_coeff[cb[s][0]:cb[s][1]].reshape(3, sh_lst[s].nlm_cplx) for s in range(Ns)]  # cplx
+    vwx_blocks = [sig_coeff[cb[s][0]:cb[s][1]].reshape(3, sh_lst[s].nlm) for s in range(Ns)]          # real
 
     # self + near cross: both produce target-basis VWX coefficients, summed in-basis (no COB).
     out_blocks = []
@@ -537,7 +543,8 @@ def Stk3d_onsurf_apply(sig_coeff: jax.Array, Sp: SuspensionDict, Ns: int, sh_lst
             far_evals[sind][0](vwx_blocks[sind], sl_scal_lst[sind], dl_scal_lst[sind]).reshape(-1)
             for sind in far_evals])
         dest_all = jnp.concatenate([dest for (_, dest) in far_evals.values()])
-        far_grid = jnp.zeros(Ngrid, dtype=jnp.complex128).at[dest_all].add(u_all)
+        # far_grid = jnp.zeros(Ngrid, dtype=jnp.complex128).at[dest_all].add(u_all)   # cplx far kernel
+        far_grid = jnp.zeros(Ngrid, dtype=jnp.float64).at[dest_all].add(u_all)        # real _stk_far -> float64
         for tind in range(Ns):
             t_sph = spheres[tind]; nphi_t, ntheta_t = t_sph["Xcart"].shape[:2]
             th_t, ph_t = t_sph["Xsph"][:, :, 0], t_sph["Xsph"][:, :, 1]
@@ -546,108 +553,6 @@ def Stk3d_onsurf_apply(sig_coeff: jax.Array, Sp: SuspensionDict, Ns: int, sh_lst
                 Stk3d.sig_xyz2vwx(gt[:, :, 0], gt[:, :, 1], gt[:, :, 2], th_t, ph_t, sh_lst[tind]))
 
     return jnp.concatenate([b.reshape(-1) for b in out_blocks])
-
-
-# ---------------------------------------------------------------------------
-# NUMPY-ONLY TWINS (temporary diagnostic; selected by Stk3d_onsurf_solve_spla(numpy=True)).
-# Mirror build_ps_evaluators / build_far_evaluators / Stk3d_onsurf_apply with all JAX removed
-# (Stk3d_np.* kernels, np arrays, np.add.at scatter, Python chunk loop around the kernel; note
-# the Stk3d_np far kernels still use the original per-operator broadcast formulation).
-# ---------------------------------------------------------------------------
-def build_ps_evaluators_np(Sp: SuspensionDict, Ns: int, sh_lst, sep_mat: jax.Array) -> dict:
-    """Numpy twin of build_ps_evaluators: eagerly build the plain-Python point-and-shoot
-    evaluator (Stk3d_np.point_n_shoot_evaluator_np) for every NEAR off-diagonal pair."""
-    spheres = Sp["spheres_lst"]
-    evals = {}
-    for tind in range(Ns):
-        for sind in range(Ns):
-            if sind != tind and bool(sep_mat[tind, sind] == 0):
-                evals[(tind, sind)] = Stk3d_np.point_n_shoot_evaluator_np(
-                    spheres[tind], sh_lst[tind], spheres[sind], sh_lst[sind], near=True)
-    return evals
-
-
-def build_far_evaluators_np(Sp: SuspensionDict, Ns: int, sh_lst, sep_mat: jax.Array,
-                            far_chunk: int = 2048) -> dict:
-    """Numpy twin of build_far_evaluators. One plain far evaluator per source sphere with >=1
-    far target; the (Ntrg_s x Nsrc x 3) broadcast in Stk3d_np.bio_offsurf_apply_np is bounded by
-    a Python loop over target CHUNKS of <far_chunk> (numpy has no trace-memory constraint, so
-    this is a simple for-loop rather than jax.lax.map). Returns {sind: (far_eval, dest)} with
-    dest the flat output rows (np.arange) the (Ntrg_s,3) output scatters to, in Xtrg order."""
-    spheres = Sp["spheres_lst"]
-    bounds = _block_bounds3(Sp, Ns)
-    evals = {}
-    for sind in range(Ns):
-        far_t = [tind for tind in range(Ns)
-                 if tind != sind and bool(sep_mat[tind, sind] == 1)]
-        if not far_t:
-            continue
-        Xtrg_s = np.concatenate([np.asarray(spheres[t]["Xcart"], dtype=np.float64).reshape(-1, 3)
-                                 for t in far_t])                       # (Ntrg_s, 3)
-        Ntrg_s = int(Xtrg_s.shape[0])
-        dest = np.concatenate([np.arange(bounds[t][0], bounds[t][1]) for t in far_t])  # (3*Ntrg_s,)
-
-        s_sph = spheres[sind]
-        sh_s = sh_lst[sind]
-        nphi_s, ntheta_s = s_sph["Xcart"].shape[:2]
-
-        def _make_far_eval(s_sph, sh_s, Xtrg_s, Ntrg_s, nphi_s, ntheta_s):
-            def far_eval(sigma_s, sl, dl):
-                S = {**s_sph, "Sigma": np.asarray(sigma_s, dtype=np.complex128).reshape(nphi_s, ntheta_s, 3)}
-                out = np.empty((Ntrg_s, 3), dtype=np.complex128)
-                for st in range(0, Ntrg_s, far_chunk):
-                    en = min(st + far_chunk, Ntrg_s)
-                    out[st:en] = Stk3d_np.bio_offsurf_apply_np(Xtrg_s[st:en], S, sh_s, sl, dl, far=True)
-                return out                                              # (Ntrg_s, 3)
-            return far_eval
-
-        evals[sind] = (_make_far_eval(s_sph, sh_s, Xtrg_s, Ntrg_s, nphi_s, ntheta_s), dest)
-    return evals
-
-
-def Stk3d_onsurf_apply_np(sigma, Sp: SuspensionDict, Ns: int, sh_lst: list,
-                          sl_scal_lst, dl_scal_lst, sgn_lst, ps_evals: dict,
-                          far_evals: dict):
-    """Numpy twin of Stk3d_onsurf_apply. Same block structure (self + near via concatenation,
-    far via a single scatter-add) but pure numpy: np.concatenate and np.add.at replace
-    jnp.concatenate and .at[].add. Returns a flat complex128 numpy array."""
-    spheres = Sp["spheres_lst"]
-    sigma = np.asarray(sigma, dtype=np.complex128).reshape(-1)
-    bounds = _block_bounds3(Sp, Ns)
-
-    ylist = []
-    for tind in range(Ns):
-        t_sph = spheres[tind]
-        nphi_t, ntheta_t = t_sph["Xcart"].shape[:2]
-        st, sp = bounds[tind]
-
-        sigma_t = sigma[st:sp].reshape(nphi_t, ntheta_t, 3)
-        acc = Stk3d_np.bio_onsurf_apply_np(
-            sigma_t, np.asarray(t_sph["Xsph"][:, :, 0], dtype=np.float64),
-            np.asarray(t_sph["Xsph"][:, :, 1], dtype=np.float64), sh_lst[tind],
-            sl_scal_lst[tind], dl_scal_lst[tind], sgn_lst[tind], radius=float(t_sph["r"])).reshape(-1)
-
-        for sind in range(Ns):
-            if (tind, sind) in ps_evals:
-                ss, se = bounds[sind]
-                nphi_s, ntheta_s = spheres[sind]["Xcart"].shape[:2]
-                sigma_s = sigma[ss:se].reshape(nphi_s, ntheta_s, 3)
-                cross = ps_evals[(tind, sind)](sigma_s, sl_scal_lst[sind], dl_scal_lst[sind])
-                acc = acc + np.asarray(cross, dtype=np.complex128).reshape(-1)
-        ylist.append(acc)
-
-    y = np.concatenate(ylist)
-
-    if far_evals:
-        u_all = np.concatenate([
-            far_evals[sind][0](
-                sigma[bounds[sind][0]:bounds[sind][1]].reshape(*spheres[sind]["Xcart"].shape[:2], 3),
-                sl_scal_lst[sind], dl_scal_lst[sind]).reshape(-1)
-            for sind in far_evals])
-        dest_all = np.concatenate([dest for (_, dest) in far_evals.values()])
-        np.add.at(y, dest_all, u_all)
-
-    return y
 
 
 def Stk3d_onsurf_solve(bc_vec: jax.Array, Sp: SuspensionDict, Ns, Nnodes: int, sh_lst: list,
@@ -740,13 +645,13 @@ def Stk3d_onsurf_solve(bc_vec: jax.Array, Sp: SuspensionDict, Ns, Nnodes: int, s
         rc = jnp.asarray(rc, dtype=jnp.complex128).reshape(-1)
         zlist, c0 = [], 0
         for sind in range(Ns):
-            n = 3 * sh_lst[sind].nlm_cplx
+            n = 3 * sh_lst[sind].nlm   # real/truncated layout (was nlm_cplx)
             blk = rc[c0:c0 + n]; c0 += n
             if float(sgn_lst[sind]) < 0.0:      # interior/container nullspace block -> identity
                 zlist.append(blk)
                 continue
             vwx_z = Stk3d.stokes_onsurf_direct_solve(
-                blk.reshape(3, sh_lst[sind].nlm_cplx), sh_lst[sind],
+                blk.reshape(3, sh_lst[sind].nlm), sh_lst[sind],
                 sl_scal_lst[sind], dl_scal_lst[sind], sgn_lst[sind], radius=Sp["spheres_lst"][sind]["r"])
             zlist.append(vwx_z.reshape(-1))
         return jnp.concatenate(zlist)   # jax array: keeps the solve on-device (no host sync)
@@ -832,20 +737,28 @@ def Stk3d_onsurf_solve(bc_vec: jax.Array, Sp: SuspensionDict, Ns, Nnodes: int, s
 def Stk3d_onsurf_solve_spla(bc_vec: jax.Array, Sp: SuspensionDict, Ns, Nnodes: int, sh_lst: list,
                        sl_scal_lst, dl_scal_lst, sgn_lst,
                        tol: float = 1e-10, atol: float = 1e-14, maxiter: int = 200,
-                       precond: bool = True, far_chunk: int = None, numpy: bool = False):
+                       precond: bool = True, precond_interior: bool = True, far_chunk: int = None):
     """
     Solve K[sigma] = bc_vec for the suspension Stokes surface density sigma (vector).
 
     An optional block-Jacobi preconditioner applies each sphere's spectral direct self-solve
-    (Stk3d.stokes_onsurf_direct_solve, radius-aware) -- but ONLY for exterior spheres (sgn == +1).
-    An interior-formulation sphere (sgn == -1) carries a double-layer nullspace, so its self-block
-    is near-singular and inverting it (cond ~1e20) amplifies the near-null modes and stalls GMRES;
-    that block is left as identity in the preconditioner instead.
+    (Stk3d.stokes_onsurf_direct_solve, radius-aware). By default (precond_interior=True) EVERY
+    sphere is preconditioned, including interior/container spheres (sgn == -1); set
+    precond_interior=False to leave those blocks as identity (exterior-only preconditioning).
 
-    numpy=True (TEMPORARY DIAGNOSTIC): run the operator/preconditioner through the pure-numpy
-    Stk3d_np twins (plain shtns C calls, no JAX trace) instead of the JAX kernels, so the cost is
-    attributable in an ordinary CPU profiler. The geometry, sep_mat, GMRES call and convergence
-    reporting are otherwise identical; only the matvec/psolve internals differ.
+    Interior-formulation spheres carry a double-layer nullspace (2 null modes per sphere: the
+    l=0 V/W modes), so their diagonal self-block has 2 zero eigenvalues -- but it is otherwise
+    perfectly conditioned (nonzero eigenvalues in [-1, -1/3], cond 3, INDEPENDENT of lmax). The
+    direct self-solve's safe_div leaves those 2 null modes as identity, so inverting the block is
+    stable under scipy GMRES's global-norm stopping test (unlike lineax's elementwise test in
+    Stk3d_onsurf_solve, which is why THAT path still skips it -- see its docstring). Preconditioning
+    the interior block roughly HALVES the Krylov depth, which matters at high lmax: with it left as
+    identity the un-preconditioned container is the far source whose VWX->QST synthesis amplifies
+    coefficient roundoff by ~0.58*l (~300x at lmax=512), raising the far-coupling residual floor
+    toward `tol`; restarted GMRES(20) then needs ~7 restart cycles (146 iters) to grind under it,
+    whereas one cycle suffices when the block is preconditioned (measured container BVP lmax=512:
+    146 iters/2593s -> ~20 iters(1 cycle)/307s, same 7e-11 residual). See
+    [[suspension-real-transform-migration]].
 
     Returns (sigma_flat, time_solve, niters, info, resid); info == 0 means GMRES converged.
     """
@@ -853,28 +766,17 @@ def Stk3d_onsurf_solve_spla(bc_vec: jax.Array, Sp: SuspensionDict, Ns, Nnodes: i
     bc_vec = jnp.asarray(bc_vec, dtype=jnp.complex128).reshape(-1)
     bounds = _block_bounds3(Sp, Ns)            # static per-sphere flat row ranges
 
-    if numpy:
-        ps_evals = build_ps_evaluators_np(Sp, Ns, sh_lst, sep_mat)
-        far_evals = build_far_evaluators_np(Sp, Ns, sh_lst, sep_mat, far_chunk=far_chunk or 2048)
-    else:
-        ps_evals = build_ps_evaluators(Sp, Ns, sh_lst, sep_mat)
-        far_evals = build_far_evaluators(Sp, Ns, sh_lst, sep_mat, far_chunk=far_chunk)
+    ps_evals = build_ps_evaluators(Sp, Ns, sh_lst, sep_mat)
+    far_evals = build_far_evaluators(Sp, Ns, sh_lst, sep_mat, far_chunk=far_chunk)
 
-    # System size / RHS: the numpy diagnostic path stays in GRID space (its Stk3d_np twins are
-    # grid-based); the JAX path solves in COEFFICIENT space -- change of basis at the boundaries
-    # (bc -> coeff here, solution coeff -> grid at the end) and inside the matvec, so the system is
-    # square in the physical DOFs (no oversampled-grid complement / residual floor).
-    Nsys = 3 * int(Nnodes)
-    b = np.asarray(bc_vec, dtype=np.complex128)
-    if not numpy:
-        Nsys = _coeff_len_stk(Ns, sh_lst)
-        b = np.asarray(grid2coeff_stk(bc_vec, Sp, Ns, sh_lst, bounds), dtype=np.complex128)
+    # The JAX path solves in COEFFICIENT space -- change of basis at the boundaries (bc -> coeff
+    # here, solution coeff -> grid at the end) and inside the matvec, so the system is square in
+    # the physical DOFs (no oversampled-grid complement / residual floor).
+    Nsys = _coeff_len_stk(Ns, sh_lst)
+    b = np.asarray(grid2coeff_stk(bc_vec, Sp, Ns, sh_lst, bounds), dtype=np.complex128)
 
-    # Operator matvec: numpy twin (pure numpy, grid space) or JAX (coeff-space, called directly).
+    # Operator matvec: JAX coeff-space operator, called directly.
     def matvec(x):
-        if numpy:
-            return Stk3d_onsurf_apply_np(x, Sp, Ns, sh_lst,
-                                         sl_scal_lst, dl_scal_lst, sgn_lst, ps_evals, far_evals)
         y = Stk3d_onsurf_apply(jnp.asarray(x), Sp, Ns, sh_lst,
                                sl_scal_lst, dl_scal_lst, sgn_lst, ps_evals, far_evals)
         return np.array(y, dtype=np.complex128)
@@ -886,40 +788,22 @@ def Stk3d_onsurf_solve_spla(bc_vec: jax.Array, Sp: SuspensionDict, Ns, Nnodes: i
     M = None
     if precond:
         def psolve(r):
-            # Interior formulation (sgn == -1): its self-block carries a double-layer nullspace,
-            # so the direct self-solve is a near-singular inverse (cond ~1e20) that amplifies the
-            # near-null modes and stalls GMRES. Use identity for that block; only exterior spheres
-            # (sgn == +1) get the block-Jacobi self-solve.
-            if numpy:
-                r = np.asarray(r, dtype=np.complex128).reshape(-1)
-                zlist = []
-                for sind in range(Sp["Ns"]):
-                    s_sph = Sp["spheres_lst"][sind]
-                    nphi, ntheta = s_sph["Xcart"].shape[:2]
-                    sl = _block_slice3(Sp, sind)
-                    if float(sgn_lst[sind]) < 0.0:      # interior/container nullspace block -> identity
-                        zlist.append(r[sl])
-                        continue
-                    zs = Stk3d_np.stokes_onsurf_direct_solve_np(
-                        r[sl].reshape(nphi, ntheta, 3),
-                        np.asarray(s_sph["Xsph"][:, :, 0], dtype=np.float64),
-                        np.asarray(s_sph["Xsph"][:, :, 1], dtype=np.float64),
-                        sh_lst[sind], sl_scal_lst[sind], dl_scal_lst[sind], sgn_lst[sind],
-                        radius=float(s_sph["r"]))
-                    zlist.append(zs.reshape(-1))
-                return np.concatenate(zlist)
-
-            # JAX: block-Jacobi direct self-solve, natively in coefficient (VWX) space (no COB).
+            # Block-Jacobi direct self-solve, natively in coefficient (VWX) space (no COB).
+            # Interior/container spheres (sgn == -1) carry a double-layer nullspace; their direct
+            # self-solve's safe_div leaves the 2 null modes as identity, so it is stable under
+            # scipy's global-norm GMRES and preconditioning them roughly halves the Krylov depth
+            # (see the docstring). precond_interior=False reverts to exterior-only (identity on the
+            # sgn<0 blocks) if a caller wants the old behaviour.
             rc = jnp.asarray(r, dtype=jnp.complex128).reshape(-1)
             zlist, c0 = [], 0
             for sind in range(Sp["Ns"]):
-                n = 3 * sh_lst[sind].nlm_cplx
+                n = 3 * sh_lst[sind].nlm
                 blk = rc[c0:c0 + n]; c0 += n
-                if float(sgn_lst[sind]) < 0.0:      # interior/container nullspace block -> identity
+                if float(sgn_lst[sind]) < 0.0 and not precond_interior:   # interior block -> identity
                     zlist.append(blk)
                     continue
                 vwx_z = Stk3d.stokes_onsurf_direct_solve(
-                    blk.reshape(3, sh_lst[sind].nlm_cplx), sh_lst[sind],
+                    blk.reshape(3, sh_lst[sind].nlm), sh_lst[sind],
                     sl_scal_lst[sind], dl_scal_lst[sind], sgn_lst[sind], radius=Sp["spheres_lst"][sind]["r"])
                 zlist.append(vwx_z.reshape(-1))
             return np.array(jnp.concatenate(zlist), dtype=np.complex128)
@@ -927,8 +811,7 @@ def Stk3d_onsurf_solve_spla(bc_vec: jax.Array, Sp: SuspensionDict, Ns, Nnodes: i
 
     # Eager warmup (concrete zeros input): compile the jitted per-pair point-and-shoot / far
     # kernels + self blocks in matvec (and the preconditioner's direct self-solves) once here,
-    # so the timed GMRES loop below pays no JIT-compile cost. (numpy=True: harmless no-compile
-    # warm call.)
+    # so the timed GMRES loop below pays no JIT-compile cost.
     jax.block_until_ready(matvec(np.zeros((Nsys,), dtype=np.complex128)))
     if M is not None:
         jax.block_until_ready(psolve(np.zeros((Nsys,), dtype=np.complex128)))
@@ -942,8 +825,8 @@ def Stk3d_onsurf_solve_spla(bc_vec: jax.Array, Sp: SuspensionDict, Ns, Nnodes: i
     r_abs = float(np.linalg.norm(matvec(sol) - b))
     resid = r_abs if bnorm <= 0 else r_abs / bnorm
     niters = counter.count
-    # change of basis after the solve: coeff -> grid density (numpy path is already grid).
-    sigma = jnp.asarray(sol, dtype=jnp.complex128) if numpy else coeff2grid_stk(jnp.asarray(sol), Sp, Ns, sh_lst)
+    # change of basis after the solve: coeff -> grid density.
+    sigma = coeff2grid_stk(jnp.asarray(sol), Sp, Ns, sh_lst)
     return sigma, t_solve, niters, info, resid
 
 

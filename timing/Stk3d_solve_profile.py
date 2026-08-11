@@ -141,11 +141,11 @@ def make_components(Sp, Ns, sh_lst, sl_lst, dl_lst, sgn_lst, ps_evals, far_evals
     Ngrid = bounds[-1][1]
     cb, c0 = [], 0
     for s in range(Ns):
-        n = 3 * sh_lst[s].nlm_cplx; cb.append((c0, c0 + n)); c0 += n
+        n = 3 * sh_lst[s].nlm; cb.append((c0, c0 + n)); c0 += n
     Ncoef = c0
 
     def _blocks(c):   # flat coeff vector -> list of per-sphere (3, nlm) VWX blocks
-        return [c[cb[s][0]:cb[s][1]].reshape(3, sh_lst[s].nlm_cplx) for s in range(Ns)]
+        return [c[cb[s][0]:cb[s][1]].reshape(3, sh_lst[s].nlm) for s in range(Ns)]
 
     @jax.jit
     def self_only(c):
@@ -161,7 +161,7 @@ def make_components(Sp, Ns, sh_lst, sl_lst, dl_lst, sgn_lst, ps_evals, far_evals
         def near_only(c):
             vb = _blocks(c); out = []
             for tind in range(Ns):
-                acc = jnp.zeros((3, sh_lst[tind].nlm_cplx), dtype=jnp.complex128)
+                acc = jnp.zeros((3, sh_lst[tind].nlm), dtype=jnp.complex128)
                 for sind in range(Ns):
                     if (tind, sind) in ps_evals:
                         acc = acc + ps_evals[(tind, sind)](vb[sind], sl_lst[sind], dl_lst[sind])
@@ -177,7 +177,7 @@ def make_components(Sp, Ns, sh_lst, sl_lst, dl_lst, sgn_lst, ps_evals, far_evals
                 far_evals[sind][0](vb[sind], sl_lst[sind], dl_lst[sind]).reshape(-1)
                 for sind in far_evals])
             dest_all = jnp.concatenate([dest for (_, dest) in far_evals.values()])
-            far_grid = jnp.zeros(Ngrid, dtype=jnp.complex128).at[dest_all].add(u_all)
+            far_grid = jnp.zeros(Ngrid, dtype=jnp.float64).at[dest_all].add(u_all)
             out = []
             for tind in range(Ns):
                 t_sph = spheres[tind]; nphi_t, ntheta_t = t_sph["Xcart"].shape[:2]

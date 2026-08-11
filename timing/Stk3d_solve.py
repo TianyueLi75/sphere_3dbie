@@ -59,8 +59,11 @@ def test(lmax: int, exterior: bool = True):
     BC_pot = compute_field(trg_sphere, ptsrc, force)
     BC_pot = jnp.reshape(BC_pot, S["Xcart"].shape)
 
-    # densities live in the VWX (diagonalizing) basis: COB the BC before the solve
-    vwx_bc = jnp.stack(sig_xyz2vwx(BC_pot[:, :, 0], BC_pot[:, :, 1], BC_pot[:, :, 2], theta, phi, sh))
+    # densities live in the VWX (diagonalizing) basis: COB the BC before the solve.
+    # Real/truncated sig_xyz2vwx takes float64 grid; the manufactured field is real (compute_field
+    # stores it complex128), so pass its real part.
+    BC_pot_re = jnp.real(BC_pot)
+    vwx_bc = jnp.stack(sig_xyz2vwx(BC_pot_re[:, :, 0], BC_pot_re[:, :, 1], BC_pot_re[:, :, 2], theta, phi, sh))
     sig_direct = stokes_onsurf_direct_solve(vwx_bc, sh, sl_scal, dl_scal, sgn)
     jax.block_until_ready(sig_direct)   # warmup: finish compile before timing
     tstart = time.time()
@@ -123,7 +126,8 @@ if __name__ == "__main__":
     here = os.path.dirname(os.path.abspath(__file__))
     lmax_list = [2**n for n in range(2,11)]
     Np = len(lmax_list)
-    plotname_prefix = os.path.join(here, './plots/Stk3d_1sph_')
+    # 'real_' tag so the real/truncated-transform plots do not overwrite stored complex results.
+    plotname_prefix = os.path.join(here, './plots/Stk3d_1sph_real_')
     if shtns_jax.CUDA_AVAILABLE:
         plotname_prefix += 'gpu_'
     else:
@@ -161,5 +165,5 @@ if __name__ == "__main__":
 
     plot_timing_convergence(lmax_list, Tsolve_diag, Teval, Edirect,
                             "Stk3d manufactured solution, interior",
-                            plotname_prefix+'exterior.svg')
+                            plotname_prefix+'interior.svg')
     print("Wrote"+ plotname_prefix +"interior.svg to ", here)

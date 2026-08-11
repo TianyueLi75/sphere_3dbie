@@ -124,9 +124,10 @@ def write_vtk_solution(sigma, Sp, sh_lst, dsp, sl_lst, dl_lst, bc, mode, out_dir
         Ufield[inside] = eval_field(jnp.asarray(trg_grid[inside]), sigma, Sp, sh_lst,
                                     dsp, sl_lst, dl_lst)
 
-    field_vtk = os.path.join(out_dir, f"Stk3d_container_4sph_{mode}_field.vtk")
-    field_pvtu = os.path.join(out_dir, f"Stk3d_container_4sph_{mode}_field.pvtu")
-    geom_vtk = os.path.join(out_dir, f"Stk3d_container_4sph_{mode}_geometry.vtk")
+    # '_real' tag so the real/truncated-transform VTK does not overwrite stored complex results.
+    field_vtk = os.path.join(out_dir, f"Stk3d_container_4sph_{mode}_real_field.vtk")
+    field_pvtu = os.path.join(out_dir, f"Stk3d_container_4sph_{mode}_real_field.pvtu")
+    geom_vtk = os.path.join(out_dir, f"Stk3d_container_4sph_{mode}_real_geometry.vtk")
     vtk_export.export_field(trg_data, Ufield, field_vtk, name="velocity")
     vtk_export.export_field_pvtu(trg_data, Ufield, field_pvtu, name="velocity")
     vtk_export.export_objects(geom_vtk, Sp, np.real(np.asarray(bc)).reshape(-1, 3))
@@ -245,7 +246,9 @@ def run(mode, chk, lmax_list):
     for i, lmax in enumerate(lmax_list):
         print(f"  ... starting lmax={lmax}", flush=True)
         # Only the finest lmax dumps the volumetric field for visualization.
-        vtk_dir = plots_dir if i == len(lmax_list) - 1 else None
+        # vtk_dir = plots_dir if i == len(lmax_list) - 1 else None
+        vtk_dir = None   # skip the volume VTK: its per-point near-eval at lmax=2^10 is prohibitively
+                         # slow and is not needed for the solve/eval timing comparison.
         ts, te, resid, info, iters, u_chk = test(int(lmax), chk, mode, vtk_dir=vtk_dir)
         t_solve[i], t_eval[i], iters_list[i] = ts, te, iters
         t_periter_solve[i] = ts / iters
@@ -270,7 +273,8 @@ def run(mode, chk, lmax_list):
 
 
 if __name__ == "__main__":
-    lmax_list = [2 ** n for n in range(5, 13)]   
+    # lmax_list = [2 ** n for n in range(5, 13)]        # full sweep to 2^12
+    lmax_list = [2 ** n for n in range(5, 11)]          # cap heaviest lmax at 2^10 (=1024)
     chk = make_check_points()
     print(f"{chk.shape[0]} interior check points; {NS} spheres "
           f"(container R={_R}, {NS - 1} obstacles r={_r}).", flush=True)
@@ -312,4 +316,24 @@ BC mode "container" (squirmer slip on the container, no-slip obstacles):
   512     0     40    8.771e-11      803.220      20.0805        7.954
   ... starting lmax=1024
   1024     0     40    8.771e-11     3585.076      89.6269       28.885
+
+
+
+    "Container" BVP real only transforms
+    64 interior check points; 5 spheres (container R=1.0, 4 obstacles r=0.25).
+
+    === BC mode: container ===
+     lmax  info  iters     residual   t_solve(s)    t/iter(s)    t_eval(s)
+    ... starting lmax=32
+    32     0     19    5.978e-11        4.385       0.2308        1.567
+    ... starting lmax=64
+    64     0     19    6.217e-11        7.134       0.3755        0.684
+    ... starting lmax=128
+    128     0     19    5.881e-11       24.680       1.2989        0.874
+    ... starting lmax=256
+    256     0     19    6.125e-11       94.261       4.9611        1.581
+    ... starting lmax=512
+    512     0     19    7.041e-11      365.743      19.2496        4.574
+    ... starting lmax=1024
+    1024     0     19    6.078e-11     1295.702      68.1948       15.351
 '''
