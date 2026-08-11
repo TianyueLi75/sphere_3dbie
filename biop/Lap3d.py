@@ -521,90 +521,6 @@ def Lap3d_dsl(trg: jax.Array, trgN: jax.Array, qlm_sigma: jax.Array, S: SphereDi
 
     return T_sigma
 
-@partial(jax.jit, static_argnames=["sh", "shtrg", "exterior"])
-def _lap_sl_1sph_kernel_cplx(qlm_sigma: jax.Array, a: float, trg_dr: float,
-                        sh: shtns_jax.sht, shtrg: shtns_jax.sht, exterior: bool) -> jax.Array:
-    """Jitted core of Lap3d_sl_r_1sph. Takes the source density coefficients <qlm_sigma>
-    and returns the SL potential coefficients on the target grid (in the SH basis).
-    <exterior> (the trg_dr > a branch) and the nlm pad/truncate are compile-time
-    constants (static args)."""
-    rho = trg_dr / a          # solid harmonics as if src sphere were unit; SL scales by a
-    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
-    diag = Lap3d_sl_diag_cplx(sh)   # 1sph kernel is complex-layout (nlm_cplx / sh.zl)
-    rpowers = rho ** (-l_vals - 1) if exterior else rho ** (l_vals)
-    qlm_SL_sigma = a * rpowers * qlm_sigma * diag
-
-    # Interpolate to new grid by padding or truncating coefficients to Strg['lmax']
-    nlm_src = sh.nlm_cplx
-    nlm_trg = shtrg.nlm_cplx
-    if nlm_trg > nlm_src:
-        qlm_SL_sigma = jnp.pad(qlm_SL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
-    elif nlm_trg < nlm_src:
-        qlm_SL_sigma = qlm_SL_sigma[:nlm_trg]
-
-    return qlm_SL_sigma
-
-def Lap3d_sl_r_1sph_cplx(Strg: SphereDict, shtrg: shtns_jax.sht, qlm_sigma: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
-    """
-    Off-surface evaluation at a spherical grid of targets
-        From source <S> with density coefficients <qlm_sigma> (SH basis), source uses <sh>
-        To target <Strg>, target uses SHT object <shtrg>
-    Returns the SL potential coefficients on the target grid (SH basis).
-    """
-
-    if S["lmax"] != sh.lmax:
-        print("S lmax does not match sht's lmax, reform sht.")
-        sh = shtns_jax.sht(S["lmax"], S["lmax"])
-    if Strg["lmax"] != shtrg.lmax:
-        print("Strg lmax does not match sht_trg's lmax, reform sht_trg.")
-        shtrg = shtns_jax.sht(Strg["lmax"], Strg["lmax"])
-
-    exterior = bool(Strg["r"] > S["r"])
-    return _lap_sl_1sph_kernel_cplx(qlm_sigma, S["r"], Strg["r"], sh, shtrg, exterior)
-
-@partial(jax.jit, static_argnames=["sh", "shtrg", "exterior"])
-def _lap_dl_1sph_kernel_cplx(qlm_sigma: jax.Array, a: float, trg_dr: float,
-                        sh: shtns_jax.sht, shtrg: shtns_jax.sht, exterior: bool) -> jax.Array:
-    """Jitted core of Lap3d_dl_r_1sph. Takes the source density coefficients <qlm_sigma>
-    and returns the DL potential coefficients on the target grid (in the SH basis).
-    <exterior> (the trg_dr > a branch) and the nlm pad/truncate are compile-time
-    constants (static args)."""
-    rho = trg_dr / a          # solid harmonics as if src sphere were unit; DL is scale-invariant
-    l_vals = jnp.asarray(sh.zl, dtype=jnp.float64)
-    [diag_ext, diag_int] = Lap3d_dl_diag_cplx(sh)   # 1sph kernel is complex-layout (nlm_cplx / sh.zl)
-    if exterior:
-        qlm_DL_sigma = (rho ** (-l_vals - 1)) * qlm_sigma * diag_ext
-    else:
-        qlm_DL_sigma = (rho ** (l_vals)) * qlm_sigma * diag_int
-
-    # Interpolate to new grid by padding or truncating coefficients to Strg['lmax']
-    nlm_src = sh.nlm_cplx
-    nlm_trg = shtrg.nlm_cplx
-    if nlm_trg > nlm_src:
-        qlm_DL_sigma = jnp.pad(qlm_DL_sigma, (0, nlm_trg - nlm_src), constant_values=0)
-    elif nlm_trg < nlm_src:
-        qlm_DL_sigma = qlm_DL_sigma[:nlm_trg]
-
-    return qlm_DL_sigma
-
-def Lap3d_dl_r_1sph_cplx(Strg: SphereDict, shtrg: shtns_jax.sht, qlm_sigma: jax.Array, S: SphereDict, sh: shtns_jax.sht) -> jax.Array:
-    """
-    Off-surface evaluation at a spherical grid of targets
-        From source <S> with density coefficients <qlm_sigma> (SH basis), source uses <sh>
-        To target <Strg>, target uses SHT object <shtrg>
-    Returns the DL potential coefficients on the target grid (SH basis).
-    """
-
-    if S["lmax"] != sh.lmax:
-        print("S lmax does not match sht's lmax, reform sht.")
-        sh = shtns_jax.sht(S["lmax"], S["lmax"])
-    if Strg["lmax"] != shtrg.lmax:
-        print("Strg lmax does not match sht_trg's lmax, reform sht_trg.")
-        shtrg = shtns_jax.sht(Strg["lmax"], Strg["lmax"])
-
-    exterior = bool(Strg["r"] > S["r"])
-    return _lap_dl_1sph_kernel_cplx(qlm_sigma, S["r"], Strg["r"], sh, shtrg, exterior)
-
 def compute_potential(trg: jax.Array, src: jax.Array, force: jax.Array) -> jax.Array:
     """
     Compute the Laplace potential 
@@ -835,14 +751,3 @@ def bio_offsurf_apply(trg: jax.Array, qlm_sigma: jax.Array, S: SphereDict, sh: s
     # One fused pass over the Ntrg x Nsrc pairs (and one synth) for both operators.
     return _lap_far(trg, qlm_sigma, S, sh, ("sl", "dl"), sl_scal=sl_scal, dl_scal=dl_scal)
 
-def bio_offsurf_apply_1sph(Strg: SphereDict, shtrg: shtns_jax.sht, qlm_sigma: jax.Array, S: SphereDict, sh: shtns_jax.sht, sl_scal: float, dl_scal: float) -> jax.Array:
-    """
-    Evaluate the KL formulation of <S> with density coefficients <qlm_sigma> (SH basis)
-    at a spherical grid of targets on <Strg>. Returns the potential coefficients on the
-    target grid (SH basis).
-    """
-
-    SLsigma = Lap3d_sl_r_1sph_cplx(Strg, shtrg, qlm_sigma, S, sh)
-    DLsigma = Lap3d_dl_r_1sph_cplx(Strg, shtrg, qlm_sigma, S, sh)
-    Ksigma = sl_scal * SLsigma + dl_scal * DLsigma
-    return Ksigma

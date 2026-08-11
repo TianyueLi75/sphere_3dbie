@@ -26,10 +26,13 @@ def test(lmax: int):
     dl_scal = 1.0
     
     Rtrg = radius * 1.025
-    sgn = 1.0 
-    Strg = build_sphere(center, Rtrg)
-    lmax_trg = 40 # Fix target size
-    Strg, shtrg = quadr_sphere(Strg, lmax_trg)
+    sgn = 1.0
+    # A small fixed set of exterior check points on the sphere of radius Rtrg. The concentric
+    # 1sph evaluator was removed (mirroring Stokes), so accuracy is checked with the supported
+    # point evaluator bio_offsurf_apply on a handful of points -- keeps the eager near-eval cheap.
+    _dirs = jnp.array([[1., 0., 0.], [0., 1., 0.], [0., 0., 1.],
+                       [1., 1., 1.], [1., -1., 0.5], [-1., 0.5, -1.]])
+    chk = Rtrg * _dirs / jnp.linalg.norm(_dirs, axis=1, keepdims=True)
     
     # Manufactured solutions test
     ptsrc = jnp.array([[0.1,0.3,0.15]]) 
@@ -47,7 +50,7 @@ def test(lmax: int):
     qlm_bc = sh.analys_cplx_jax(BC_pot)
     struct = jax.eval_shape(lambda: jnp.zeros((sh.nlm_cplx,), dtype=jnp.complex128))
     LapK_apply = partial(
-        bio_onsurf_apply_cplx,   # concentric 1sph accuracy eval below is cplx-only; keep whole test cplx
+        bio_onsurf_apply_cplx,   # accuracy eval below (bio_offsurf_apply_cplx) is cplx; keep whole test cplx
         sh=sh,
         sl_scal=sl_scal,
         dl_scal=dl_scal,
@@ -84,25 +87,16 @@ def test(lmax: int):
     resid_direct = jnp.linalg.norm(bc_check_direct - qlm_bc)
     jax.debug.print("Residual of DIRECT solve: {a}", a=resid_direct)
 
-    # Accuracy
-    xtrg = Strg["Xcart"][:,:,0] 
-    ytrg = Strg["Xcart"][:,:,1]
-    ztrg = Strg["Xcart"][:,:,2]
-    trg_sphere2 = jnp.column_stack([jnp.reshape(xtrg,-1), jnp.reshape(ytrg,-1), jnp.reshape(ztrg,-1)])
-    true_pot = compute_potential(trg_sphere2, ptsrc, force)
-    true_pot = jnp.real(true_pot)
+    # Accuracy at the exterior check points (radius Rtrg).
+    true_pot = jnp.real(compute_potential(chk, ptsrc, force))
 
-    # bio_offsurf_apply_1sph takes source coeffs and returns target-grid potential coeffs;
-    # synthesize to the grid for the error (timed together, matching the old grid-space eval).
-    qlm_out = bio_offsurf_apply_1sph(Strg, shtrg, sig_gmres, S, sh, sl_scal, dl_scal)
-    Ksig_gmres = shtrg.synth_cplx_jax(qlm_out)
+    Ksig_gmres = bio_offsurf_apply_cplx(chk, sig_gmres, S, sh, sl_scal, dl_scal, far=False)
     jax.block_until_ready(Ksig_gmres)   # warmup eval: finish compile before the timed direct eval
     Ksig_gmres = jnp.real(jnp.reshape(Ksig_gmres, (-1, 1)))
 
     tstart = time.time()
-    qlm_out = bio_offsurf_apply_1sph(Strg, shtrg, sig_direct, S, sh, sl_scal, dl_scal)
-    Ksig_direct = shtrg.synth_cplx_jax(qlm_out)
-    Ksig_direct.block_until_ready()
+    Ksig_direct = bio_offsurf_apply_cplx(chk, sig_direct, S, sh, sl_scal, dl_scal, far=False)
+    jax.block_until_ready(Ksig_direct)
     tend = time.time()
     time_eval = tend - tstart
     Ksig_direct = jnp.real(jnp.reshape(Ksig_direct, (-1, 1)))
