@@ -268,6 +268,51 @@ def coeff2grid_stk(vc: jax.Array, Sp: SuspensionDict, Ns: int, sh_lst) -> jax.Ar
     return jnp.concatenate(out)
 
 
+# --- Rigid-body-motion (mobility) building blocks -------------------------------------------
+# A particle undergoing rigid-body motion carries an unknown rigid surface velocity
+# u(x) = U + Omega x (x - c), closed by force/torque balance. These helpers map that velocity
+# to/from the VWX coefficient space the coupled combined-field solve already uses.
+
+def rigid_field_vwx(U: jax.Array, Omega: jax.Array, sph: SphereDict, sh) -> jax.Array:
+    """Stacked-VWX coefficients (3, nlm) of the rigid-body surface velocity
+        u(x) = U + Omega x (x - c)
+    on sphere <sph>. Evaluated on the Cartesian grid then transformed with sig_xyz2vwx; the
+    field is degree l<=1 so this spectral representation is exact for any lmax>=1. The lever
+    arm x - c is taken as r*Xncart (unit normal scaled by radius), which is accurate for a
+    small sphere far from the origin (see sphere.far_src_geom)."""
+    # U = jnp.asarray(U, dtype=jnp.complex128).reshape(3)          # cplx layout fed the cplx analysis
+    # Omega = jnp.asarray(Omega, dtype=jnp.complex128).reshape(3)
+    U = jnp.real(jnp.asarray(U)).reshape(3)                        # real/truncated analysis takes float64
+    Omega = jnp.real(jnp.asarray(Omega)).reshape(3)
+    rr = sph["r"] * sph["Xncart"]                              # (nphi, ntheta, 3) == x - c
+    urig = U[None, None, :] + jnp.cross(jnp.broadcast_to(Omega, rr.shape), rr)
+    th, ph = sph["Xsph"][:, :, 0], sph["Xsph"][:, :, 1]
+    vlm, wlm, xlm = Stk3d.sig_xyz2vwx(urig[:, :, 0], urig[:, :, 1], urig[:, :, 2], th, ph, sh)
+    return jnp.stack([vlm, wlm, xlm])                          # (3, nlm)
+
+
+def net_force_torque(vwx: jax.Array, sph: SphereDict, sh, c: float = 1.0) -> Tuple[jax.Array, jax.Array]:
+    """Net hydrodynamic force and torque (each (3,) complex) of the combined-field density with
+    stacked-VWX coefficients <vwx> ((3, nlm)) on sphere <sph>. Only the single-layer part of
+    K = SL + DL carries net force/torque (the double layer is force- and torque-free), so
+        F = c * integral sigma dS,   T = c * integral (x - c_sph) x sigma dS,
+    computed directly in Cartesian grid space with the physical surface measure
+        w = grid_weights * r^2      (the r^2 surface Jacobian; do NOT reapply
+                                     bio_onsurf_apply's spectral `radius` factor here -- that
+                                     is an operator-normalization artifact, not physical).
+    <c> is the sign/scale constant fixed by the traction-jump convention, calibrated against
+    single-sphere Stokes drag."""
+    th, ph = sph["Xsph"][:, :, 0], sph["Xsph"][:, :, 1]
+    vx, vy, vz = Stk3d.sig_vwx2xyz(vwx[0], vwx[1], vwx[2], th, ph, sh)
+    sig = jnp.stack([vx, vy, vz], axis=2)                     # (nphi, ntheta, 3)
+    grid_shape = sph["Xcart"].shape[:2]
+    w = (jnp.broadcast_to(sh._grid_weights(), grid_shape) * sph["r"] ** 2).astype(jnp.complex128)
+    rr = sph["r"] * sph["Xncart"]                             # x - c_sph
+    F = c * jnp.einsum("ij,ijk->k", w, sig)
+    T = c * jnp.einsum("ij,ijk->k", w, jnp.cross(rr, sig))
+    return F, T
+
+
 def Lap3d_onsurf_apply(sig_coeff: jax.Array, Sp: SuspensionDict, sh_lst: list,
                        sl_scal_lst, dl_scal_lst, sgn_lst,
                        sep_mat: jax.Array = None) -> jax.Array:
@@ -830,6 +875,233 @@ def Stk3d_onsurf_solve_spla(bc_vec: jax.Array, Sp: SuspensionDict, Ns, Nnodes: i
     return sigma, t_solve, niters, info, resid
 
 
+def Stk3d_mobility_solve(bc_vec, Sp: SuspensionDict, Ns, Nnodes: int, sh_lst: list,
+                         sl_scal_lst, dl_scal_lst, sgn_lst,
+                         forces, torques, part_idx=None,
+                         tol: float = 1e-10, atol: float = 1e-14, maxiter: int = 200,
+                         restart: int = None, precond: bool = True, far_chunk: int = None,
+                         force_const: float = 1.0, mu: float = 1.0, row_scale=None):
+    """
+    Solve the rigid-body-motion MOBILITY problem for a suspension: static Dirichlet spheres
+    (the container, sgn < 0, held at <bc_vec>, typically zero for no-slip) enclosing force/torque
+    driven rigid PARTICLES (sgn > 0). Each particle p is given an external force <forces[i]> and
+    torque <torques[i]>; its rigid-body velocity (U_p, Omega_p) is UNKNOWN and solved for together
+    with the coupled surface densities, subject to the surface velocity being exactly the rigid
+    field U_p + Omega_p x (x - c_p).
+
+    Bordered coefficient-space system (scipy GMRES, matrix-free):
+
+        [ K   -R ] [ sigma ]   [ bc_coeff ]     BIE rows  (Nc = _coeff_len_stk)
+        [ B    0 ] [ zeta  ] = [ loads    ]     force/torque rows  (6 per particle)
+
+      - K       : the existing coupled operator Stk3d_onsurf_apply (self + near + far), coeff space.
+      - R zeta  : on each particle block, the VWX coeffs of the unknown rigid field (rigid_field_vwx).
+      - B sigma : per-particle net force/torque functional (net_force_torque), only on particle blocks.
+      - zeta    : stacked (U_p, Omega_p), 6*Np unknowns (Np = number of particles). Complex to match
+                  the complex coeff space; the imaginary part comes out ~0 and is dropped.
+      - loads   : stacked (F_p, T_p). BIE rows RHS = bc_coeff (0 for a no-slip container).
+
+    The container has NO border row. The border rows and their loads are nondimensionalized by the
+    isolated-sphere self-mobility (force rows by 1/(6 pi mu a_p), torque rows by 1/(8 pi mu a_p^3),
+    <row_scale> to override) so they are O(velocity) like the BIE rows -- without this GMRES stalls.
+
+    <force_const> is the sign/scale constant of the force/torque functional (net_force_torque),
+    calibrated against single-sphere Stokes drag (= 1.0 with the code's 1/(8pi) SL normalization).
+    <restart> is scipy GMRES's Krylov depth per cycle; None uses scipy's default (20). Well-separated
+    particles converge in tens of iterations; a DENSE packing is strongly near-coupled and can stall
+    above <tol> until <restart> is raised (block-Jacobi does not precondition the near coupling). Returns
+        (sigma_grid, U_lst, Omega_lst, F_lst, T_lst, part_idx, t_solve, niters, info, resid)
+    where F_lst/T_lst are the hydrodynamic force/torque recovered from the solved density.
+    """
+    sep_mat = separate_spheres(Sp)
+    bounds = _block_bounds3(Sp, Ns)
+    ps_evals = build_ps_evaluators(Sp, Ns, sh_lst, sep_mat)
+    far_evals = build_far_evaluators(Sp, Ns, sh_lst, sep_mat, far_chunk=far_chunk)
+
+    Nc = _coeff_len_stk(Ns, sh_lst)
+    cb, c0 = [], 0                                   # per-sphere coeff block bounds (3*nlm each)
+    for s in range(Ns):
+        n = 3 * sh_lst[s].nlm; cb.append((c0, c0 + n)); c0 += n   # real/truncated layout (was nlm_cplx)
+
+    if part_idx is None:
+        part_idx = [s for s in range(Ns) if float(sgn_lst[s]) > 0.0]   # particles = exterior spheres
+    Np = len(part_idx)
+    Nz = 6 * Np
+    Naug = Nc + Nz
+
+    forces = jnp.asarray(forces, dtype=jnp.complex128).reshape(Np, 3) if Np else jnp.zeros((0, 3))
+    torques = jnp.asarray(torques, dtype=jnp.complex128).reshape(Np, 3) if Np else jnp.zeros((0, 3))
+
+    # Border row / load scaling: isolated-sphere self-mobility, so border rows are O(velocity).
+    if row_scale is None:
+        rs = []
+        for s in part_idx:
+            a = float(Sp["spheres_lst"][s]["r"])
+            sF = 1.0 / (6.0 * np.pi * mu * a)
+            sT = 1.0 / (8.0 * np.pi * mu * a ** 3)
+            rs.extend([sF, sF, sF, sT, sT, sT])
+        rs_row = np.asarray(rs, dtype=np.float64)
+    else:
+        rs_row = np.asarray(row_scale, dtype=np.float64).reshape(Nz)
+    rs_row_j = jnp.asarray(rs_row, dtype=jnp.complex128)
+
+    # RHS: BIE rows = container Dirichlet BC in coeff space (0 for no-slip); border rows = scaled loads.
+    if bc_vec is None:
+        b_bie = np.zeros((Nc,), dtype=np.complex128)
+    else:
+        b_bie = np.asarray(grid2coeff_stk(jnp.asarray(bc_vec, dtype=jnp.complex128).reshape(-1),
+                                          Sp, Ns, sh_lst, bounds), dtype=np.complex128)
+    loads = np.concatenate([np.concatenate([np.asarray(forces[i]), np.asarray(torques[i])])
+                            for i in range(Np)]) if Np else np.zeros((0,), dtype=np.complex128)
+    b = np.concatenate([b_bie, loads * rs_row])
+
+    def matvec(x):
+        x = jnp.asarray(x, dtype=jnp.complex128).reshape(-1)
+        sig = x[:Nc]
+        zeta = x[Nc:].reshape(Np, 6)
+        y = Stk3d_onsurf_apply(sig, Sp, Ns, sh_lst, sl_scal_lst, dl_scal_lst, sgn_lst, ps_evals, far_evals)
+        # BIE rows: subtract the unknown rigid velocity on each particle's block ( (K sig)_p - R_p zeta ).
+        for i, s in enumerate(part_idx):
+            rc = rigid_field_vwx(zeta[i, :3], zeta[i, 3:], Sp["spheres_lst"][s], sh_lst[s]).reshape(-1)
+            y = y.at[cb[s][0]:cb[s][1]].add(-rc)
+        # Border rows: net force/torque of each particle's density block, self-mobility scaled.
+        yb = []
+        for i, s in enumerate(part_idx):
+            vwx_s = sig[cb[s][0]:cb[s][1]].reshape(3, sh_lst[s].nlm)   # real/truncated layout
+            F, T = net_force_torque(vwx_s, Sp["spheres_lst"][s], sh_lst[s], c=force_const)
+            yb.append(jnp.concatenate([F, T]))
+        yb = (jnp.concatenate(yb) * rs_row_j) if yb else jnp.zeros((0,), dtype=jnp.complex128)
+        return np.array(jnp.concatenate([y, yb]), dtype=np.complex128)
+
+    A = spla.LinearOperator((Naug, Naug), matvec=matvec, dtype=np.complex128)
+
+    M = None
+    if precond:
+        def psolve(r):
+            r = jnp.asarray(r, dtype=jnp.complex128).reshape(-1)
+            rc, rz = r[:Nc], r[Nc:]
+            zlist, k0 = [], 0
+            for sind in range(Ns):
+                n = 3 * sh_lst[sind].nlm
+                blk = rc[k0:k0 + n]; k0 += n
+                if float(sgn_lst[sind]) < 0.0:      # interior/container nullspace block -> identity
+                    zlist.append(blk); continue
+                vwx_z = Stk3d.stokes_onsurf_direct_solve(
+                    blk.reshape(3, sh_lst[sind].nlm), sh_lst[sind],
+                    sl_scal_lst[sind], dl_scal_lst[sind], sgn_lst[sind], radius=Sp["spheres_lst"][sind]["r"])
+                zlist.append(vwx_z.reshape(-1))
+            return np.array(jnp.concatenate([jnp.concatenate(zlist), rz]), dtype=np.complex128)  # identity on zeta
+        M = spla.LinearOperator((Naug, Naug), matvec=psolve, dtype=np.complex128)
+
+    # Eager warmup so the timed GMRES loop pays no JIT cost.
+    jax.block_until_ready(matvec(np.zeros((Naug,), dtype=np.complex128)))
+    if M is not None:
+        jax.block_until_ready(psolve(np.zeros((Naug,), dtype=np.complex128)))
+
+    # restart = Krylov depth per cycle. A dense packing (strongly near-coupled particles) needs a
+    # deep Krylov space that block-Jacobi cannot shortcut, so restarted GMRES can stall well above
+    # tol at scipy's default restart (20); raise <restart> (memory-costlier) for those geometries.
+    gk = {} if restart is None else {"restart": int(min(restart, Naug))}
+    counter = IterationCounter()
+    tstart = time.time()
+    try:
+        sol, info = spla.gmres(A, b, M=M, rtol=tol, atol=atol, maxiter=maxiter, callback=counter, **gk)
+    except TypeError:
+        sol, info = spla.gmres(A, b, M=M, tol=tol, atol=atol, maxiter=maxiter, callback=counter, **gk)
+    t_solve = time.time() - tstart
+
+    bnorm = float(np.linalg.norm(b))
+    r_abs = float(np.linalg.norm(matvec(sol) - b))
+    resid = r_abs if bnorm <= 0 else r_abs / bnorm
+    niters = counter.count
+
+    sig_sol = jnp.asarray(sol[:Nc], dtype=jnp.complex128)
+    sigma = coeff2grid_stk(sig_sol, Sp, Ns, sh_lst)
+    zeta = np.asarray(sol[Nc:]).reshape(Np, 6) if Np else np.zeros((0, 6))
+    U_lst = [np.real(zeta[i, :3]) for i in range(Np)]
+    Omega_lst = [np.real(zeta[i, 3:]) for i in range(Np)]
+    # Hydrodynamic force/torque recovered from the solved density (unscaled physical units).
+    F_lst, T_lst = [], []
+    for i, s in enumerate(part_idx):
+        vwx_s = sig_sol[cb[s][0]:cb[s][1]].reshape(3, sh_lst[s].nlm)   # real/truncated layout
+        F, T = net_force_torque(vwx_s, Sp["spheres_lst"][s], sh_lst[s], c=force_const)
+        F_lst.append(np.real(np.asarray(F))); T_lst.append(np.real(np.asarray(T)))
+
+    return sigma, U_lst, Omega_lst, F_lst, T_lst, part_idx, t_solve, niters, info, resid
+
+
+def mobility_convergence_4sph(levels=(8, 12, 16, 20, 24, 32), lmax_container=80,
+                              g=1.0, mu=1.0, tol=1e-11, maxiter=200):
+    """
+    Self-convergence test of the rigid-body-motion mobility solve on the 4-sphere-in-container
+    system: a unit no-slip container (sphere 0, sgn=-1) holding four r=0.25 particles at the
+    vertices of a regular tetrahedron (centres at |x|=0.5), each driven by a gravity-like body
+    force F=(0,0,-g*volume) with zero torque (exterior rigid-body BC, sgn=+1). The rigid velocity
+    (U_p, Omega_p) of every particle is UNKNOWN and solved for.
+
+    Refines the interior spherical-harmonic order over <levels> (the container order is fixed at
+    <lmax_container>, well past its own resolution needs) and reports, against the finest level as
+    reference, the max change in each particle's (U_p, Omega_p) and the change in the fluid velocity
+    at three fixed interior probe points. Both converge spectrally: U/Omega saturate at round-off by
+    lmax_interior ~ 12, the point velocities at a rate set by their gap to the nearest particle
+    surface. Probes avoid the exact container centre (r=0), where the interior spectral synthesis is
+    degenerate. Returns the per-level results dict.
+    """
+    s = 0.5 / jnp.sqrt(3.0)
+    tetra = jnp.array([[1., 1., 1.], [1., -1., -1.], [-1., 1., -1.], [-1., -1., 1.]]) * s
+    centers = jnp.concatenate([jnp.zeros((1, 3)), tetra])
+    radii = jnp.array([1.0, 0.25, 0.25, 0.25, 0.25])
+    Ns = 5
+    sgn_lst = [-1.0] + [1.0] * 4
+    sl_lst = [1.0] * Ns; dl_lst = [1.0] * Ns
+    vol = (4.0 / 3.0) * np.pi * 0.25 ** 3
+    forces = np.zeros((4, 3)); forces[:, 2] = -g * vol
+    torques = np.zeros((4, 3))
+    probes = jnp.array([[0.10, -0.15, 0.08], [0.6, 0.0, 0.0], [0.0, 0.5, 0.3]])
+
+    def solve_at(lmax_int):
+        Sp = build_suspension(centers, radii, 0.1)
+        Sp, sh_lst = quadr_suspension(Sp, jnp.array([lmax_container] + [lmax_int] * 4))
+        dsp = Sp["Nnodes_dsp"]; Nnodes = dsp[-1].item()
+        out = Stk3d_mobility_solve(None, Sp, Ns, Nnodes, sh_lst, sl_lst, dl_lst, sgn_lst,
+                                   forces, torques, tol=tol, maxiter=maxiter, mu=mu)
+        sigma, U_lst, Om_lst = out[0], out[1], out[2]
+        niter, info, resid = out[7], out[8], out[9]
+        # fluid velocity at the probe points = sum of every sphere's combined layer potential
+        approx = jnp.zeros((probes.shape[0], 3), dtype=jnp.complex128)
+        for k in range(Ns):
+            sph = Sp["spheres_lst"][k]; nphi, ntheta = sph["Xcart"].shape[:2]
+            sig_k = sigma[3 * int(dsp[k]):3 * int(dsp[k + 1])].reshape(nphi, ntheta, 3)
+            vwx = jnp.stack(Stk3d.sig_xyz2vwx(sig_k[:, :, 0], sig_k[:, :, 1], sig_k[:, :, 2],
+                                              sph["Xsph"][:, :, 0], sph["Xsph"][:, :, 1], sh_lst[k]))
+            approx = approx + Stk3d.bio_offsurf_apply(probes, vwx, sph, sh_lst[k], sl_lst[k], dl_lst[k])
+        return dict(U=np.array(U_lst), Om=np.array(Om_lst), vel=np.real(np.asarray(approx)),
+                    niter=niter, info=info, resid=resid)
+
+    res = {}
+    for L in levels:
+        res[L] = solve_at(L)
+        print(f"lmax_int={L:3d}: info={res[L]['info']} niter={res[L]['niter']:3d} resid={res[L]['resid']:.1e}")
+
+    ref = res[levels[-1]]
+    npb = int(probes.shape[0])
+    print(f"\n=== self-convergence vs reference lmax_int = {levels[-1]} ===")
+    print(f"{'lmax':>5} | {'max|dU|':>10} {'max|dOmega|':>12} | " +
+          " ".join(f"|dvel|p{i}".rjust(10) for i in range(npb)))
+    for L in levels[:-1]:
+        dU = np.max(np.abs(res[L]['U'] - ref['U']))
+        dOm = np.max(np.abs(res[L]['Om'] - ref['Om']))
+        dv = np.linalg.norm(res[L]['vel'] - ref['vel'], axis=1)
+        print(f"{L:5d} | {dU:10.2e} {dOm:12.2e} | " + " ".join(f"{x:10.2e}" for x in dv))
+
+    print(f"\n=== reference values (lmax_int = {levels[-1]}) ===")
+    for pk in range(4):
+        print(f"  sphere {pk + 1}: U={ref['U'][pk]}  Omega={ref['Om'][pk]}")
+    for i in range(npb):
+        print(f"  probe {i} {np.asarray(probes[i])}: u={ref['vel'][i]}")
+    return res
+
+
 if __name__ == "__main__":
     """
     Two-sphere exterior Laplace manufactured-solution test.
@@ -947,7 +1219,7 @@ if __name__ == "__main__":
 
     '''
 
-    # '''
+    '''
     print("======= TEST 3: An obstacle with slip inside a no-slip container ===============")
     centers = jnp.array([[0., 0., 0.], [0.3, 0.1, -0.05]])
     radii = jnp.array([1.0, 0.2])
@@ -1023,4 +1295,13 @@ if __name__ == "__main__":
     # bc_vec = np.real(np.asarray(bc)).reshape(-1, 3)
     # vtk_export.export_objects(os.path.join(vis_dir, "container_obstacle_geometry.vtk"), Sp, bc_vec)
     # print("Wrote VTK (geometry) to", vis_dir)
+    '''
+
+    # '''
+    # Rigid-body-motion MOBILITY self-convergence on the 4-sphere-in-container system:
+    #   container (sphere 0): static no-slip (u = 0);  particles (spheres 1-4): force/torque
+    #   driven rigid-body motion, (U_p, Omega_p) solved for. Refines the interior order and checks
+    #   that U/Omega and the fluid velocity at interior probe points converge spectrally.
+    print("======= TEST 4: 4-sphere-in-container mobility self-convergence ================")
+    mobility_convergence_4sph()
     # '''
