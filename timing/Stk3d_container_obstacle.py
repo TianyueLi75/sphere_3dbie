@@ -28,7 +28,7 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from suspension import build_suspension, quadr_suspension, Stk3d_onsurf_solve, Stk3d_onsurf_solve_spla
+from suspension import build_suspension, quadr_suspension, Stk3d_onsurf_solve
 from sphere import set_density
 from biop import Stk3d
 
@@ -76,9 +76,9 @@ def test(lmax: int, chk: jax.Array):
 
     # Warmup: compile the jitted self-block / preconditioner kernels for this lmax's shapes
     # with a single (untimed) GMRES iteration, so they are excluded from the timed solve.
-    Stk3d_onsurf_solve_spla(bc, Sp, Ns, Nnodes, sh_lst, sl_lst, dl_lst, SGN_LST, maxiter=1)
+    Stk3d_onsurf_solve(bc, Sp, Ns, Nnodes, sh_lst, sl_lst, dl_lst, SGN_LST, maxiter=1)
 
-    sigma, t_solve, iters, info, resid = Stk3d_onsurf_solve_spla(bc, Sp, Ns, Nnodes, sh_lst, sl_lst, dl_lst, SGN_LST)
+    sigma, t_solve, iters, info, resid = Stk3d_onsurf_solve(bc, Sp, Ns, Nnodes, sh_lst, sl_lst, dl_lst, SGN_LST)
 
     # Time the off-surface field evaluation at the fixed check points.
     t0 = time.time()

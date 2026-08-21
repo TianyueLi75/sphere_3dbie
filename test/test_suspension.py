@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import pytest
 
 from suspension import (build_suspension, quadr_suspension,
-                        Lap3d_onsurf_solve, Stk3d_onsurf_solve_spla)
+                        Lap3d_onsurf_solve, Stk3d_onsurf_solve)
 from biop import Lap3d, Stk3d
 
 SL, DL = 1.0, 1.0
@@ -75,7 +75,7 @@ def test_two_sphere_exterior_stokes():
             Stk3d.compute_field(nodes, ptsrc, force).reshape(-1))
 
     Nnodes = dsp[-1].item()
-    sigma, t_solve, niter, info, resid = Stk3d_onsurf_solve_spla(
+    sigma, t_solve, niter, info, resid = Stk3d_onsurf_solve(
         bc, Sp, Ns, Nnodes, sh_lst, sl_lst, dl_lst, sgn_lst)
     assert info == 0, f"GMRES did not converge (info={info})"
     assert float(resid) < 1e-8, f"residual too large: {float(resid):.3e}"
@@ -116,7 +116,7 @@ def test_obstacle_in_container_stokes():
     bc = bc.at[3 * int(dsp[1]):3 * int(dsp[2])].set(jnp.stack([sx, sy, sz], axis=2).reshape(-1))
 
     Nnodes = dsp[-1].item()
-    sigma, t_solve, niter, info, resid = Stk3d_onsurf_solve_spla(
+    sigma, t_solve, niter, info, resid = Stk3d_onsurf_solve(
         bc, Sp, Ns, Nnodes, sh_lst, sl_lst, dl_lst, sgn_lst)
     assert info == 0, f"GMRES did not converge (info={info})"
     assert float(resid) < 1e-9, f"residual too large: {float(resid):.3e}"

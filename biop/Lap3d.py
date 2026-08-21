@@ -21,7 +21,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import numpy as np
-import lineax as lx
+# import lineax as lx
 import shtns
 import shtns_jax
 

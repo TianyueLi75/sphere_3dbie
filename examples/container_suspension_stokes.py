@@ -111,7 +111,7 @@ def main():
 
     # --- Coupled solve ---
     Nnodes = dsp[-1].item()
-    sigma, t_solve, niter, info, resid = susp.Stk3d_onsurf_solve_spla(bc, Sp, Sp["Ns"], Nnodes, sh_lst, sl_lst, dl_lst, sgn_lst, args.tol)
+    sigma, t_solve, niter, info, resid = susp.Stk3d_onsurf_solve(bc, Sp, Sp["Ns"], Nnodes, sh_lst, sl_lst, dl_lst, sgn_lst, args.tol)
     print(f"GMRES info (0 == converged): {info}, time for solve is {t_solve}s, num of iters is {niter}, residual = {resid:.3e}")
 
     # --- Volumetric velocity field: interior to container, exterior to every obstacle ---
