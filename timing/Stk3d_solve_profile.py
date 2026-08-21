@@ -24,9 +24,7 @@ Run (from repo root, CPU venv):
 
 `quick` runs a short sweep for a smoke test / decomposition sanity check.
 
-Note on the solve metric: the block-Jacobi preconditioner leaves the interior container block
-unpreconditioned, which stalls lineax GMRES on the near problem; the scipy path
-(Stk3d_onsurf_solve_spla) converges, so it is used for niters/resid. Its t_solve includes a
+Note on the solve metric: the scipy-driven Stk3d_onsurf_solve is used for niters/resid. Its t_solve includes a
 one-time XLA compile (no warmup) -- that confound is measured separately below as
 first-call vs steady-state matvec time, so the clean per-iteration cost comes from the warmed
 component timings, not from t_solve/niters.
@@ -50,7 +48,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from suspension import (build_suspension, quadr_suspension, separate_spheres,
                         build_ps_evaluators, build_far_evaluators, Stk3d_onsurf_apply,
-                        Stk3d_onsurf_solve_spla, _block_bounds3)
+                        Stk3d_onsurf_solve, _block_bounds3)
 from biop import Stk3d
 
 jax.config.update("jax_enable_x64", True)
@@ -122,7 +120,7 @@ def time_call(fn, arg, repeats: int = 5):
 
 def time_first_vs_steady(fn, arg):
     """Time the FIRST call (XLA compile + run) vs a subsequent steady call. The gap is the
-    one-time compile cost that Stk3d_onsurf_solve_spla pays under its (un-warmed) timer."""
+    one-time compile cost that Stk3d_onsurf_solve pays under its (un-warmed) timer."""
     t0 = time.time(); jax.block_until_ready(fn(arg)); t_first = time.time() - t0
     t0 = time.time(); jax.block_until_ready(fn(arg)); t_steady = time.time() - t0
     return t_first, t_steady
@@ -238,7 +236,7 @@ def profile_one(geom: str, lmax: int, repeats: int = 3, do_solve: bool = True):
            "t_first": t_first, "t_compile": t_first - t_steady, **times}
 
     if do_solve:
-        _, t_solve, niters, info, resid = Stk3d_onsurf_solve_spla(
+        _, t_solve, niters, info, resid = Stk3d_onsurf_solve(
             bc, Sp, Ns, Nnodes, sh_lst, sl_lst, dl_lst, sgn_lst)
         row.update({"t_solve": t_solve, "niters": int(niters), "info": int(info),
                     "resid": float(resid)})

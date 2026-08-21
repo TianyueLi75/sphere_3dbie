@@ -48,8 +48,6 @@ from biop import Stk3d
 import vtk_export
 
 import scipy.sparse.linalg as spla
-import lineax as lx
-from lineax._norm import two_norm
 from functools import partial
 
 SuspensionDict = Dict[str, Any]
@@ -397,7 +395,7 @@ def Lap3d_onsurf_solve(bc_pot: jax.Array, Sp: SuspensionDict, sh_lst: list,
 def _block_bounds3(Sp: SuspensionDict, Ns: int) -> list:
     """Per-sphere (start, stop) row ranges in a flat Stokes density vector, computed from the
     grid SHAPES (3 * nphi * ntheta each). Shapes are static even when the underlying arrays are
-    JAX tracers, so these bounds stay CONCRETE inside lineax's traced operator -- unlike
+    JAX tracers, so these bounds stay CONCRETE inside the traced matvec operator -- unlike
     int(Sp["Nnodes_dsp"][...]), which concretizes a (closure-lifted) tracer and fails."""
     spheres = Sp["spheres_lst"]
     bounds, start = [], 0
@@ -414,7 +412,7 @@ def build_ps_evaluators(Sp: SuspensionDict, Ns: int, sh_lst, sep_mat: jax.Array)
     pair (tind != sind and sep_mat[tind, sind] == 0), keyed (tind, sind). Each evaluator
     (Stk3d.point_n_shoot_evaluator) closes over its pair's CONCRETE geometry (rotation
     C-objects, ring constants) and maps a source density (nphi_s, ntheta_s, 3) -> velocity at
-    sphere tind's grid. Built once here, outside the lineax-traced matvec, so the eager
+    sphere tind's grid. Built once here, outside the traced matvec, so the eager
     rotation/keying work never runs under a trace.
 
     FAR pairs are intentionally excluded: they are handled by the rotation-free smooth-quadrature
@@ -454,7 +452,7 @@ def build_far_evaluators(Sp: SuspensionDict, Ns: int, sh_lst, sep_mat: jax.Array
         output vector that far_eval's flattened (Ntrg_s, 3) output writes to, in Xtrg order. This
         encodes the entire scatter (one .at[dest].add), so no per-chunk loop is needed.
     Only vwx_s/sl/dl are dynamic; Xtrg and source geometry (Xcart, Xncart, r, lmax) and sh are
-    closed over concretely, so this traces cleanly inside the lineax matvec."""
+    closed over concretely, so this traces cleanly inside the matvec."""
     spheres = Sp["spheres_lst"]
     bounds = _block_bounds3(Sp, Ns)
     evals = {}
@@ -507,7 +505,7 @@ def Stk3d_onsurf_apply(sig_coeff: jax.Array, Sp: SuspensionDict, Ns: int, sh_lst
     sphere); the return uses the same layout. Taking/returning coefficients lets the GMRES matvec
     call this directly with no coeff<->grid round trip -- only the far contribution needs a change
     of basis (analys of its grid point-values), since the smooth quadrature is inherently on the
-    grid. Pure JAX (safe for lineax).
+    grid. Pure JAX (safe to trace).
     """
     spheres = Sp["spheres_lst"]
     sig_coeff = jnp.asarray(sig_coeff, dtype=jnp.complex128).reshape(-1)
@@ -557,185 +555,6 @@ def Stk3d_onsurf_apply(sig_coeff: jax.Array, Sp: SuspensionDict, Ns: int, sh_lst
 
 def Stk3d_onsurf_solve(bc_vec: jax.Array, Sp: SuspensionDict, Ns, Nnodes: int, sh_lst: list,
                        sl_scal_lst, dl_scal_lst, sgn_lst,
-                       tol: float = 1e-10, atol: float = 1e-12, maxiter: int = 4,
-                       restart: int = 40, precond: bool = True, far_chunk: int = None):
-    """
-    Solve K[sigma] = bc_vec for the suspension Stokes surface density sigma (vector).
-
-    lineax GMRES on the matrix-free coupled operator. The operator (matvec) closes over the
-    CONCRETE geometry in Sp / sh_lst / sep_mat, so only the flat density vector is dynamic --
-    lineax then treats all geometry as constant operator data. The function is intentionally
-    NOT jitted: the cross-sphere point_n_shoot build (shtns rotation C objects, whose angle is
-    frozen in a C config) is eager, and this routine also times the solve on the host.
-
-    An optional block-Jacobi preconditioner applies each sphere's spectral direct self-solve
-    (Stk3d.stokes_onsurf_direct_solve, radius-aware) -- but ONLY for exterior spheres (sgn == +1).
-    An interior-formulation sphere (sgn == -1) carries a double-layer nullspace, so its self-block
-    is near-singular and inverting it (cond ~1e20) amplifies the near-null modes and stalls GMRES;
-    that block is left as identity in the preconditioner instead.
-
-    Preconditioning (precond=True) is baked in as RIGHT preconditioning -- the operator is A@M and
-    the unknown is u with x = M@u -- with M the block-Jacobi self-solve on the EXTERIOR spheres only
-    (interior/container sgn<0 blocks stay identity; see the preconditioner comment below). This makes
-    lineax's monitored residual the TRUE residual b - A@x against the raw-b scale (the criterion scipy
-    uses), and keeps the preconditioned system nonsingular.
-
-    Convergence is judged from the recomputed true relative residual ||K sigma - bc|| / ||bc||, NOT
-    from lineax's flag: lineax 0.1.0's stopping test does not fire cleanly on this problem (the
-    no-slip container BC is exactly zero, so its elementwise atol+rtol|b| scale collapses to the
-    atol floor on those rows, and the container nullspace keeps the Cauchy-step criterion from
-    settling), so it would grind to machine precision over many cycles.
-
-    The solve is therefore a SINGLE `lx.linear_solve` from a zero initial guess -- lineax does its
-    own restarting internally, `maxiter` caps the number of restart cycles via max_steps, and the
-    true residual is recomputed once at the end to set `info`. There is deliberately no warm start
-    from a previous iterate.
-
-    The consequence, which the caller must size for: lineax keeps cycling past the point where the
-    true residual has cleared `tol` -- sometimes to the full `maxiter` (TEST 3 lmax=16 runs all 51
-    of a 51-cycle budget), sometimes exiting on its own criterion a few cycles late (5-sphere
-    container lmax=20, restart=40: 3 cycles for a residual that is already ~1e-15 after 1). So
-    `maxiter` is kept SMALL and convergence rests on `restart` being >= the problem's Krylov depth.
-    One cycle of GMRES(40) already reaches ~1e-15 on
-    the 2-sphere container (depth ~23) and the 5-sphere container (depth ~39). When `restart` is
-    below the depth, restarted GMRES discards its Krylov space each cycle and convergence degrades
-    sharply -- measured on the 5-sphere container at lmax=20, restart=10 needs ~12 cycles and is
-    still at 5.9e-6 after 4 -- so a `restart` bump, not a `maxiter` bump, is the fix; raising
-    `maxiter` costs its full price whether or not it is needed (TEST 3 lmax=16: maxiter=50 spends
-    2040 matvecs / 10.3s to reach the same 2.3e-16 that one cycle reaches in 0.34s).
-    See [[lineax-gmres-restart-stokes-solve]].
-
-    Returns (sigma_flat, time_solve, niters, info, resid); `niters` is the number of real restart
-    cycles run (each is up to `restart` matvecs); info == 0 means the true relative residual is
-    within `tol`. `resid` is the relative ||K sigma - bc|| / ||bc||.
-    """
-    sep_mat = separate_spheres(Sp)             # eager -> concrete near/far flags
-    bc_vec = jnp.asarray(bc_vec, dtype=jnp.complex128).reshape(-1)
-    bounds = _block_bounds3(Sp, Ns)            # static per-sphere flat row ranges
-    Nc = _coeff_len_stk(Ns, sh_lst)            # coefficient system size (concatenated VWX)
-    struct = jax.ShapeDtypeStruct((Nc,), jnp.complex128)
-    bc_coeff = grid2coeff_stk(bc_vec, Sp, Ns, sh_lst, bounds)   # change of basis before the solve
-
-    # Pre-build the cross-evaluators EAGERLY (concrete geometry), outside the matvec -- lineax
-    # closure-converts / eval_shapes the operator, which abstracts every closed-over array, so
-    # eager rotation builds / _ps_geom_key (float(r), np.asarray(Xc)) cannot run under trace.
-    # NEAR pairs -> point-and-shoot; FAR targets -> rotation-free smooth-quadrature per source.
-    ps_evals = build_ps_evaluators(Sp, Ns, sh_lst, sep_mat)
-    far_evals = build_far_evaluators(Sp, Ns, sh_lst, sep_mat, far_chunk=far_chunk)
-
-    # Coefficient-space matvec: Stk3d_onsurf_apply is itself coeff -> coeff, so call it directly
-    # (no coeff<->grid round trip). GMRES runs entirely in coefficient space, so the system is
-    # square in the physical DOFs (no oversampled-grid complement / residual floor).
-    def matvec(xc):
-        return Stk3d_onsurf_apply(xc, Sp, Ns, sh_lst, sl_scal_lst, dl_scal_lst, sgn_lst, ps_evals, far_evals)
-    # Eager warmup (concrete input): compiles the per-pair _core kernels + self blocks once.
-    jax.block_until_ready(matvec(jnp.zeros((Nc,), dtype=jnp.complex128)))
-
-    # Block-Jacobi preconditioner M: per-sphere spectral direct self-solve, natively in coefficient
-    # (VWX) space -- no COB needed. Its safe_div handles the l=0 toroidal phantom / zero-diagonal
-    # modes. EXCEPTION: interior-formulation spheres (sgn < 0, e.g. the no-slip container) carry a
-    # genuine double-layer nullspace, so their self-block is near-singular; a direct-solve inverse of
-    # it does not remove that nullspace, it just feeds an amplifying near-singular operator into the
-    # Krylov system, and lineax's stopping logic (residual + Cauchy-step) can then never early-exit
-    # -- it grinds to ~1e-16 over 30-150 restart cycles regardless of tol / left-vs-right fold /
-    # restart. Leaving that block as IDENTITY keeps the preconditioned system nonsingular so lineax
-    # converges cleanly (~4 iters). Exterior spheres (sgn > 0) still get the block-Jacobi self-solve.
-    # See [[lineax-gmres-restart-stokes-solve]].
-    def psolve(rc):
-        rc = jnp.asarray(rc, dtype=jnp.complex128).reshape(-1)
-        zlist, c0 = [], 0
-        for sind in range(Ns):
-            n = 3 * sh_lst[sind].nlm   # real/truncated layout (was nlm_cplx)
-            blk = rc[c0:c0 + n]; c0 += n
-            if float(sgn_lst[sind]) < 0.0:      # interior/container nullspace block -> identity
-                zlist.append(blk)
-                continue
-            vwx_z = Stk3d.stokes_onsurf_direct_solve(
-                blk.reshape(3, sh_lst[sind].nlm), sh_lst[sind],
-                sl_scal_lst[sind], dl_scal_lst[sind], sgn_lst[sind], radius=Sp["spheres_lst"][sind]["r"])
-            zlist.append(vwx_z.reshape(-1))
-        return jnp.concatenate(zlist)   # jax array: keeps the solve on-device (no host sync)
-
-    # Preconditioning is baked into the operator/RHS as RIGHT preconditioning: solve (A@M) u = b,
-    # then recover x = M@u. We do NOT pass M to lineax as options["preconditioner"] (that is LEFT
-    # preconditioning) for two reasons, both rooted in lineax 0.1.0's convergence test
-    # `||preconditioner @ (b - A y)|| / (atol + rtol*|b|)` (gmres.py):
-    #   1. LEFT: the numerator is the PRECONDITIONED residual ||M(b-Ay)|| but the scale is built from
-    #      the RAW b, so the ratio is inconsistent -- and because M is a near-singular inverse
-    #      (container/interior double-layer nullspace, cond ~1e20) that AMPLIFIES the residual on the
-    #      near-null modes, GMRES must grind those modes to ~1e-16 true residual just to clear the
-    #      test (measured: 77+ restart cycles, overshooting to ~1e-16, vs scipy's 13 iters at 1e-12).
-    #   2. RIGHT: with op = A@M and rhs = b, lineax's residual b - A@M@u == b - A@x is the TRUE
-    #      residual against the raw-b scale -- exactly the criterion scipy uses -- so it converges in
-    #      ~the same iteration count as scipy and stops without over-resolving the amplified modes.
-    # See [[lineax-gmres-restart-stokes-solve]].
-    if precond:
-        op_apply = lambda u: matvec(psolve(u))   # A @ M
-        rhs = bc_coeff                            # unchanged (right preconditioning)
-    else:
-        op_apply = matvec
-        rhs = bc_coeff
-
-    gmres_func = lx.FunctionLinearOperator(op_apply, struct)
-    # norm=two_norm: lineax defaults to max_norm with a componentwise scale, which blows up on
-    # small-|b| rows and never clears at tight tol; two_norm gives a standard relative criterion.
-    #
-    # restart / max_steps, and why the restart cycles are driven from PYTHON:
-    #   * restart = Krylov depth per cycle. lineax's inner Arnoldi loop always runs the FULL `restart`
-    #     matvecs (no per-iteration tolerance exit, gmres.py _gmres_compute) and discards the subspace
-    #     at each restart, so once `restart` drops below the depth needed to converge, convergence
-    #     degrades from one cycle to many (measured, 5-sphere container lmax=20, scipy depth 39:
-    #     restart>=40 -> 1 cycle to 2.6e-13; restart=20 -> 2 cycles; restart=10 -> 12 cycles, and
-    #     only 5.9e-6 if cut off at 4). A fixed small cycle cap therefore silently returns a
-    #     half-solved density on any problem deeper than `restart`.
-    #   * lineax's stopping test does NOT fire on this problem, so it cannot be trusted to end the
-    #     cycles. Two structural reasons it never self-terminates here: (1) the no-slip container BC is
-    #     exactly 0, so half of b is zero and lineax's ELEMENTWISE scale atol+rtol|b| collapses to the
-    #     absolute floor atol on those rows, forcing the residual there to ~atol before the ratio
-    #     clears; scipy avoids this with a GLOBAL norm ||b-Ax||/max(rtol||b||,atol). (2) the container's
-    #     double-layer nullspace makes the operator singular, so the Cauchy-step (`diff`) criterion
-    #     never settles. Neither is reachable through lineax 0.1.0's public API.
-    #   * So the restart cycles are left to lineax (one call, y0 = 0, NO warm start from a previous
-    #     iterate) and `maxiter` bounds them through max_steps, with convergence judged afterwards
-    #     from the recomputed global true residual (`info` below). The internal test is late or
-    #     absent, so the call runs well past the point where the true residual has cleared -- keep
-    #     `maxiter` small (measured, TEST 3 lmax=16: max_steps=51 spends all 51 cycles / 2040
-    #     matvecs / 10.3s to reach the same 2.3e-16 that one cycle reaches in 0.34s). Raising it
-    #     costs proportionally, so raise `restart` instead when a problem needs more depth.
-    #   * max_steps = maxiter + 1: lineax's step 0 is a NO-OP that only computes the residual
-    #     (gmres.py initialises r0 to zeros and `first_gmres` returns y unchanged, to save compiling
-    #     an extra matvec), so N max_steps perform N-1 real Arnoldi cycles -- the +1 makes `maxiter`
-    #     mean the number of REAL restart cycles. (The old max_steps=maxiter was 3 cycles, not 4.)
-    restart = int(min(restart, Nc))
-    solver = lx.GMRES(rtol=tol, atol=atol, max_steps=int(maxiter) + 1, restart=restart,
-                      stagnation_iters=50, norm=two_norm)
-    options = {"y0": jnp.zeros((Nc,), dtype=jnp.complex128)}
-
-    # throw=False: on stagnation / non-convergence (e.g. the interior container problem, which
-    # has a double-layer nullspace) lineax otherwise raises; instead return the best iterate and
-    # report it via `info` below. Warmup solve compiles the fused GMRES loop; second solve timed.
-    solution = lx.linear_solve(gmres_func, rhs, solver=solver, options=options, throw=False)
-    jax.block_until_ready(solution.value)
-    tstart = time.time()
-    solution = lx.linear_solve(gmres_func, rhs, solver=solver, options=options, throw=False)
-    jax.block_until_ready(solution.value)
-    time_solve = time.time() - tstart
-
-    # Right preconditioning solves for u; the density coeffs are x = M@u (identity when precond=off).
-    sol_coeff = psolve(solution.value) if precond else solution.value
-    niters = int(solution.stats["num_steps"]) - 1        # drop the no-op step 0
-    # Judge convergence from the true (coefficient-space) residual, not lineax's flag (see docstring):
-    # its Cauchy-step criterion reports `stagnation` at a machine-precision plateau even when exact.
-    resid = jnp.linalg.norm(matvec(sol_coeff) - bc_coeff)
-    bc_norm = jnp.linalg.norm(bc_coeff)
-    resid_rel = resid / bc_norm if bc_norm > 0 else resid
-    info = 0 if float(resid_rel) <= tol else 1
-
-    sigma = coeff2grid_stk(sol_coeff, Sp, Ns, sh_lst)          # change of basis after the solve
-    return sigma, time_solve, niters, info, resid_rel
-
-def Stk3d_onsurf_solve_spla(bc_vec: jax.Array, Sp: SuspensionDict, Ns, Nnodes: int, sh_lst: list,
-                       sl_scal_lst, dl_scal_lst, sgn_lst,
                        tol: float = 1e-10, atol: float = 1e-14, maxiter: int = 200,
                        precond: bool = True, precond_interior: bool = True, far_chunk: int = None):
     """
@@ -750,8 +569,7 @@ def Stk3d_onsurf_solve_spla(bc_vec: jax.Array, Sp: SuspensionDict, Ns, Nnodes: i
     l=0 V/W modes), so their diagonal self-block has 2 zero eigenvalues -- but it is otherwise
     perfectly conditioned (nonzero eigenvalues in [-1, -1/3], cond 3, INDEPENDENT of lmax). The
     direct self-solve's safe_div leaves those 2 null modes as identity, so inverting the block is
-    stable under scipy GMRES's global-norm stopping test (unlike lineax's elementwise test in
-    Stk3d_onsurf_solve, which is why THAT path still skips it -- see its docstring). Preconditioning
+    stable under scipy GMRES's global-norm stopping test. Preconditioning
     the interior block roughly HALVES the Krylov depth, which matters at high lmax: with it left as
     identity the un-preconditioned container is the far source whose VWX->QST synthesis amplifies
     coefficient roundoff by ~0.58*l (~300x at lmax=512), raising the far-coupling residual floor
